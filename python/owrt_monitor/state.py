@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+from enum import StrEnum
+
+
+class JobState(StrEnum):
+    PENDING = "PENDING"
+    PREFLIGHT = "PREFLIGHT"
+    BUILD_RUNNING = "BUILD_RUNNING"
+    BUILD_SUCCEEDED = "BUILD_SUCCEEDED"
+    ARTIFACT_SELECTED = "ARTIFACT_SELECTED"
+    ARTIFACT_EXPORTED = "ARTIFACT_EXPORTED"
+    DRY_RUN = "DRY_RUN"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"

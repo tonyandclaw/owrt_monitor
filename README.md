@@ -12,4 +12,33 @@
 
 - [TODO.md](TODO.md): 長期實作 roadmap 與 checklist。
 - [ARCHITECTURE.md](ARCHITECTURE.md): 系統架構、資料流、模組邊界與穩定性設計。
+- [docs/quickstart.md](docs/quickstart.md): 目前 MVP 的安裝與操作方式。
+- [docs/config-reference.md](docs/config-reference.md): YAML config 欄位說明。
 
+## Current MVP
+
+目前第一版已經可以：
+
+- 驗證 YAML config。
+- 執行 dry-run，產出 job directory、JSONL events、SQLite state 與 report。
+- 在 Docker builder container 內執行 OpenWrt build command。
+- 依 glob pattern 偵測 firmware artifact，支援 newest/largest/fail-if-multiple 選擇策略。
+- 用 `docker cp` 匯出 firmware，計算 SHA256，保存 artifact metadata。
+
+安裝開發環境：
+
+```sh
+python3 -m pip install -e ".[dev,serial]"
+```
+
+常用指令：
+
+```sh
+owrt-monitor validate --config configs/example.yaml
+owrt-monitor dry-run --config configs/example.yaml
+owrt-monitor build --config configs/example.yaml
+owrt-monitor status --config configs/example.yaml
+```
+
+DUT serial、firmware transfer、`sysupgrade` 與 post-upgrade tests 已先在 config/schema
+中保留欄位，實際控制流程會放在下一階段實作。
