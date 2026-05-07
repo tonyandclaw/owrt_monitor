@@ -103,6 +103,49 @@ class JobStore:
                 (job_id, container_path, str(host_path), filename, size_bytes, sha256, _now()),
             )
 
+    def acquire_dut_lock(self, *, dut_name: str, owner_job_id: str) -> bool:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO dut_locks (dut_name, owner_job_id, created_at, heartbeat_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (dut_name, owner_job_id, _now(), _now()),
+                )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    def release_dut_lock(self, *, dut_name: str, owner_job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM dut_locks
+                 WHERE dut_name = ? AND owner_job_id = ?
+                """,
+                (dut_name, owner_job_id),
+            )
+
+    def record_test_result(
+        self,
+        *,
+        job_id: str,
+        command: str,
+        passed: bool,
+        output: str,
+        duration_sec: float,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO test_results (
+                  job_id, command, passed, output, duration_sec, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, command, int(passed), output, duration_sec, _now()),
+            )
+
     def recent_jobs(self, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -162,8 +205,32 @@ class JobStore:
             )
             """,
             """
+            CREATE TABLE IF NOT EXISTS dut_locks (
+              dut_name TEXT PRIMARY KEY,
+              owner_job_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              heartbeat_at TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS test_results (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              job_id TEXT NOT NULL,
+              command TEXT NOT NULL,
+              passed INTEGER NOT NULL,
+              output TEXT NOT NULL,
+              duration_sec REAL NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(job_id) REFERENCES jobs(id)
+            )
+            """,
+            """
             CREATE INDEX IF NOT EXISTS idx_job_events_job_id
               ON job_events(job_id, ts)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_test_results_job_id
+              ON test_results(job_id, created_at)
             """,
         ]
         with self._connect() as connection:

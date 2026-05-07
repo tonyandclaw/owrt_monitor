@@ -52,14 +52,14 @@
   - [ ] DUT profile。
   - [ ] test profile。
 - [x] 支援 secret/env interpolation，但避免把 secret 寫進 log。
-- [x] 支援 dry-run，列出即將執行的 Docker/artifact actions。
+- [x] 支援 dry-run，列出即將執行的 Docker/artifact/DUT actions。
 
 ## Phase 2 - Python Orchestrator MVP
 
 - [ ] 建立 Python CLI：
   - [x] `owrt-monitor build`。
-  - [ ] `owrt-monitor flash`。
-  - [ ] `owrt-monitor test`。
+  - [x] `owrt-monitor flash`。
+  - [x] `owrt-monitor test`。
   - [x] `owrt-monitor run`。
   - [x] `owrt-monitor status`。
 - [ ] 實作 workflow state machine：
@@ -67,11 +67,11 @@
   - [x] build。
   - [x] artifact detection。
   - [x] artifact export。
-  - [ ] DUT prepare。
-  - [ ] firmware transfer。
-  - [ ] upgrade。
-  - [ ] reboot wait。
-  - [ ] post-upgrade tests。
+  - [x] DUT prepare。
+  - [x] firmware transfer。
+  - [x] upgrade。
+  - [x] reboot wait。
+  - [x] post-upgrade tests。
   - [x] report。
 - [ ] 使用 SQLite 保存 job state，支援 crash recovery。
 - [ ] 每個 step 都要有：
@@ -118,52 +118,52 @@
 ## Phase 4 - DUT Serial Control
 
 - [ ] 支援 USB serial discovery：
-  - [ ] `/dev/cu.usbserial-*`。
-  - [ ] `/dev/tty.usbserial-*`。
-  - [ ] custom path。
+  - [x] `/dev/cu.usbserial-*`。
+  - [x] `/dev/tty.usbserial-*`。
+  - [x] custom path。
 - [ ] 支援 serial config：
-  - [ ] baud rate。
+  - [x] baud rate。
   - [ ] data bits/parity/stop bits。
-  - [ ] newline mode。
-  - [ ] prompt regex。
+  - [x] newline mode。
+  - [x] prompt regex。
 - [ ] 實作 robust serial session：
-  - [ ] connect/disconnect。
+  - [x] connect/disconnect。
   - [ ] read loop。
-  - [ ] command write。
-  - [ ] prompt wait。
-  - [ ] boot log capture。
-  - [ ] timeout handling。
+  - [x] command write。
+  - [x] prompt wait。
+  - [x] boot log capture。
+  - [x] timeout handling。
 - [ ] 支援 login flow：
-  - [ ] root shell without password。
+  - [x] root shell without password。
   - [ ] username/password。
   - [ ] custom prompt。
 - [ ] 支援 reboot detection：
   - [ ] kernel boot marker。
   - [ ] login prompt。
   - [ ] OpenWrt banner。
-  - [ ] shell prompt ready。
-- [ ] 支援 DUT lock，避免兩個 job 同時 flash 同一台 DUT。
+  - [x] shell prompt ready。
+- [x] 支援 DUT lock，避免兩個 job 同時 flash 同一台 DUT。
 
 ## Phase 5 - Firmware Transfer and Upgrade
 
 - [ ] 支援 firmware transfer methods：
-  - [ ] host HTTP server + DUT `wget`/`curl`。
+  - [x] host HTTP server + DUT `wget`/`curl`。
   - [ ] SCP when DUT network is ready。
   - [ ] TFTP for bootloader/recovery flow。
   - [ ] custom command。
 - [ ] host 啟動臨時 HTTP server：
-  - [ ] bind interface。
-  - [ ] random safe port。
+  - [x] bind interface。
+  - [x] random safe port。
   - [ ] checksum endpoint。
   - [ ] transfer log。
 - [ ] DUT 下載 firmware 後檢查：
-  - [ ] file exists。
-  - [ ] file size。
-  - [ ] SHA256。
+  - [x] file exists。
+  - [x] file size。
+  - [x] SHA256。
 - [ ] 支援 OpenWrt upgrade：
-  - [ ] `sysupgrade`。
-  - [ ] `mtd` custom flow。
-  - [ ] platform-specific script。
+  - [x] `sysupgrade`。
+  - [x] `mtd` custom flow。
+  - [x] platform-specific script。
 - [ ] upgrade 前 safety checks：
   - [ ] artifact target matches DUT target。
   - [ ] minimum battery/power note if applicable。
@@ -171,15 +171,15 @@
   - [ ] no active conflicting job。
 - [ ] upgrade 後等待 reboot：
   - [ ] serial disconnect/reconnect tolerance。
-  - [ ] boot timeout。
-  - [ ] prompt detection。
+  - [x] boot timeout。
+  - [x] prompt detection。
   - [ ] fail-fast on kernel panic。
-- [ ] 保存完整 upgrade transcript。
+- [x] 保存完整 upgrade transcript。
 
 ## Phase 6 - Post-Upgrade Testing
 
 - [ ] 支援 test runner interface：
-  - [ ] serial shell tests。
+  - [x] serial shell tests。
   - [ ] SSH tests。
   - [ ] pytest tests。
   - [ ] custom scripts。
@@ -193,9 +193,9 @@
 - [ ] 支援 board-specific tests。
 - [ ] 支援 test result report：
   - [ ] passed/failed/skipped。
-  - [ ] duration。
-  - [ ] logs。
-  - [ ] firmware metadata。
+  - [x] duration。
+  - [x] logs。
+  - [x] firmware metadata。
 - [ ] 支援 fail artifact retention，失敗時保存 firmware/log/config snapshot。
 
 ## Phase 7 - Go Runner / Daemon
