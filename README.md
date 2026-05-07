@@ -24,6 +24,9 @@
 - 在 Docker builder container 內執行 OpenWrt build command。
 - 依 glob pattern 偵測 firmware artifact，支援 newest/largest/fail-if-multiple 選擇策略。
 - 用 `docker cp` 匯出 firmware，計算 SHA256，保存 artifact metadata。
+- 透過 USB serial 控制 DUT prompt、啟動臨時 HTTP firmware server、執行 `wget` transfer。
+- 在顯式 `--allow-flash` 下執行 configured upgrade command，等待 DUT prompt 回來。
+- 執行 configured smoke tests，保存 serial transcript 與 test results。
 
 安裝開發環境：
 
@@ -37,8 +40,11 @@ python3 -m pip install -e ".[dev,serial]"
 owrt-monitor validate --config configs/example.yaml
 owrt-monitor dry-run --config configs/example.yaml
 owrt-monitor build --config configs/example.yaml
+owrt-monitor run --config configs/example.yaml --allow-flash
+owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+owrt-monitor test --config configs/example.yaml
 owrt-monitor status --config configs/example.yaml
 ```
 
-DUT serial、firmware transfer、`sysupgrade` 與 post-upgrade tests 已先在 config/schema
-中保留欄位，實際控制流程會放在下一階段實作。
+`run --allow-flash` 和 `flash --allow-flash` 會執行破壞性的 DUT upgrade command；先用
+`--dry-run` 檢查 report 內容，再對真機執行。

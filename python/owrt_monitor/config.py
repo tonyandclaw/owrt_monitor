@@ -88,6 +88,17 @@ class DutConfig(StrictModel):
     serial: str | None = None
     baud: int = 115200
     prompt: str = r"root@OpenWrt:.*# "
+    newline: Literal["lf", "crlf"] = "lf"
+    connect_timeout_sec: int = 30
+    command_timeout_sec: int = 30
+    discovery_patterns: list[str] = Field(
+        default_factory=lambda: [
+            "/dev/cu.usbserial-*",
+            "/dev/tty.usbserial-*",
+            "/dev/cu.usbmodem*",
+            "/dev/tty.usbmodem*",
+        ]
+    )
     login: LoginConfig = Field(default_factory=LoginConfig)
     network: DutNetworkConfig = Field(default_factory=DutNetworkConfig)
 
@@ -98,23 +109,50 @@ class DutConfig(StrictModel):
             raise ValueError("dut.baud must be positive")
         return value
 
+    @field_validator("connect_timeout_sec", "command_timeout_sec")
+    @classmethod
+    def dut_timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("DUT timeouts must be positive")
+        return value
+
 
 class UpgradeConfig(StrictModel):
     transfer: Literal["http", "scp", "tftp", "custom"] = "http"
     remote_path: str = "/tmp/firmware.bin"
     command: str = "sysupgrade -n /tmp/firmware.bin"
     boot_timeout_sec: int = 240
+    transfer_timeout_sec: int = 180
+    http_bind: str = "0.0.0.0"
+    http_host: str | None = None
+    http_port: int = 0
+    verify_sha256: bool = True
 
-    @field_validator("boot_timeout_sec")
+    @field_validator("boot_timeout_sec", "transfer_timeout_sec")
     @classmethod
-    def boot_timeout_must_be_positive(cls, value: int) -> int:
+    def upgrade_timeout_must_be_positive(cls, value: int) -> int:
         if value <= 0:
-            raise ValueError("upgrade.boot_timeout_sec must be positive")
+            raise ValueError("upgrade timeouts must be positive")
+        return value
+
+    @field_validator("http_port")
+    @classmethod
+    def http_port_must_be_valid(cls, value: int) -> int:
+        if value < 0 or value > 65535:
+            raise ValueError("upgrade.http_port must be between 0 and 65535")
         return value
 
 
 class TestConfig(StrictModel):
     smoke: list[str] = Field(default_factory=list)
+    command_timeout_sec: int = 30
+
+    @field_validator("command_timeout_sec")
+    @classmethod
+    def test_timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("tests.command_timeout_sec must be positive")
+        return value
 
 
 class OwrtConfig(StrictModel):

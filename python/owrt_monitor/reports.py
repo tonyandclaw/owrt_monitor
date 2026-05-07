@@ -20,6 +20,7 @@ class WorkflowReport:
     actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     artifact: ExportedArtifact | None = None
+    test_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -82,5 +83,11 @@ def _markdown_report(data: dict[str, Any]) -> str:
     if data["warnings"]:
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- {warning}" for warning in data["warnings"])
+
+    if data["test_results"]:
+        lines.extend(["", "## Smoke Tests", ""])
+        for result in data["test_results"]:
+            status = "passed" if result["passed"] else "failed"
+            lines.append(f"- `{result['command']}`: {status}")
 
     return "\n".join(lines) + "\n"
