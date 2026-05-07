@@ -1,0 +1,43 @@
+project:
+  name: owrt-monitor-lab
+  artifact_dir: ../artifacts
+
+builder:
+  container: openwrt-builder
+  workdir: /work/openwrt
+  command:
+    - make
+    - -j8
+  env:
+    FORCE_UNSAFE_CONFIGURE: "1"
+  timeout_sec: 0
+
+artifact:
+  patterns:
+    - bin/targets/**/**/openwrt-*-sysupgrade.bin
+  selection: newest
+  min_size_mb: 4
+  require_sha256: true
+
+dut:
+  name: dut-01
+  serial: /dev/cu.usbserial-0001
+  baud: 115200
+  prompt: "root@OpenWrt:.*# "
+  login:
+    username: root
+  network:
+    address: 192.168.1.1
+    interface: br-lan
+
+upgrade:
+  transfer: http
+  remote_path: /tmp/firmware.bin
+  command: sysupgrade -n /tmp/firmware.bin
+  boot_timeout_sec: 240
+
+tests:
+  smoke:
+    - ubus call system board
+    - opkg list-installed
+    - /etc/init.d/network status

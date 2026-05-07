@@ -4,81 +4,81 @@
 
 ## Phase 0 - Project Foundations
 
-- [ ] 決定第一批支援平台：
-  - [ ] macOS host。
-  - [ ] Docker / Docker Desktop。
-  - [ ] OpenWrt build container。
-  - [ ] USB serial DUT。
-- [ ] 決定 config 格式，預設使用 YAML。
-- [ ] 建立 repo skeleton：
-  - [ ] `cmd/owrtd/` for Go daemon。
-  - [ ] `cmd/owrtctl/` for Go CLI helper, optional。
-  - [ ] `python/owrt_monitor/` for Python orchestrator package。
-  - [ ] `configs/` for sample YAML。
-  - [ ] `tests/` for unit/integration tests。
-  - [ ] `docs/` for user/developer docs。
-- [ ] 建立基本開發工具：
-  - [ ] Go module。
-  - [ ] Python package metadata。
-  - [ ] formatter/linter。
-  - [ ] Makefile or task runner。
-  - [ ] GitHub Actions basic lint/test。
-- [ ] 定義專案用語：
-  - [ ] Job。
-  - [ ] Build。
-  - [ ] Artifact。
-  - [ ] DUT。
-  - [ ] Upgrade。
-  - [ ] Test run。
-  - [ ] Session。
+- [x] 決定第一批支援平台：
+  - [x] macOS host。
+  - [x] Docker / Docker Desktop。
+  - [x] OpenWrt build container。
+  - [x] USB serial DUT。
+- [x] 決定 config 格式，預設使用 YAML。
+- [x] 建立 repo skeleton：
+  - [x] `cmd/owrtd/` for Go daemon。
+  - [x] `cmd/owrtctl/` for Go CLI helper, optional。
+  - [x] `python/owrt_monitor/` for Python orchestrator package。
+  - [x] `configs/` for sample YAML。
+  - [x] `tests/` for unit/integration tests。
+  - [x] `docs/` for user/developer docs。
+- [x] 建立基本開發工具：
+  - [x] Go module。
+  - [x] Python package metadata。
+  - [x] formatter/linter。
+  - [x] Makefile or task runner。
+  - [x] GitHub Actions basic lint/test。
+- [x] 定義專案用語：
+  - [x] Job。
+  - [x] Build。
+  - [x] Artifact。
+  - [x] DUT。
+  - [x] Upgrade。
+  - [x] Test run。
+  - [x] Session。
 
 ## Phase 1 - Configuration Model
 
-- [ ] 設計 YAML schema：
-  - [ ] builder/container。
-  - [ ] build command。
-  - [ ] artifact patterns。
-  - [ ] host artifact output directory。
-  - [ ] DUT serial settings。
-  - [ ] DUT network settings。
-  - [ ] firmware transfer method。
-  - [ ] upgrade command。
-  - [ ] post-upgrade boot checks。
-  - [ ] test commands。
-- [ ] 實作 config validation。
+- [x] 設計 YAML schema：
+  - [x] builder/container。
+  - [x] build command。
+  - [x] artifact patterns。
+  - [x] host artifact output directory。
+  - [x] DUT serial settings。
+  - [x] DUT network settings。
+  - [x] firmware transfer method。
+  - [x] upgrade command。
+  - [x] post-upgrade boot checks。
+  - [x] test commands。
+- [x] 實作 config validation。
 - [ ] 支援多 profile：
   - [ ] board profile。
   - [ ] target profile。
   - [ ] DUT profile。
   - [ ] test profile。
-- [ ] 支援 secret/env interpolation，但避免把 secret 寫進 log。
-- [ ] 支援 dry-run，列出即將執行的 Docker/serial/test actions。
+- [x] 支援 secret/env interpolation，但避免把 secret 寫進 log。
+- [x] 支援 dry-run，列出即將執行的 Docker/artifact actions。
 
 ## Phase 2 - Python Orchestrator MVP
 
 - [ ] 建立 Python CLI：
-  - [ ] `owrt-monitor build`。
+  - [x] `owrt-monitor build`。
   - [ ] `owrt-monitor flash`。
   - [ ] `owrt-monitor test`。
-  - [ ] `owrt-monitor run`。
-  - [ ] `owrt-monitor status`。
+  - [x] `owrt-monitor run`。
+  - [x] `owrt-monitor status`。
 - [ ] 實作 workflow state machine：
-  - [ ] preflight。
-  - [ ] build。
-  - [ ] artifact detection。
-  - [ ] artifact export。
+  - [x] preflight。
+  - [x] build。
+  - [x] artifact detection。
+  - [x] artifact export。
   - [ ] DUT prepare。
   - [ ] firmware transfer。
   - [ ] upgrade。
   - [ ] reboot wait。
   - [ ] post-upgrade tests。
-  - [ ] report。
+  - [x] report。
 - [ ] 使用 SQLite 保存 job state，支援 crash recovery。
 - [ ] 每個 step 都要有：
-  - [ ] timeout。
+  - [x] timeout。
   - [ ] retry policy。
-  - [ ] structured log。
-  - [ ] exit status。
+  - [x] structured log。
+  - [x] exit status。
   - [ ] resumability note。
 - [ ] 支援 job cancel。
 - [ ] 支援只重跑失敗 step。
@@ -86,15 +86,15 @@
 ## Phase 3 - Docker/OpenWrt Build Support
 
 - [ ] 支援 Docker container discovery。
-- [ ] 支援指定 container name/id。
+- [x] 支援指定 container name/id。
 - [ ] 支援 build 前 preflight：
-  - [ ] container running。
-  - [ ] workspace path exists。
-  - [ ] OpenWrt tree exists。
+  - [x] container running。
+  - [x] workspace path exists。
+  - [x] OpenWrt tree exists。
   - [ ] enough disk space。
   - [ ] expected feeds/config present。
-- [ ] 支援 Docker exec build command。
-- [ ] 即時收集 stdout/stderr。
+- [x] 支援 Docker exec build command。
+- [x] 即時收集 stdout/stderr。
 - [ ] 解析常見 OpenWrt build result：
   - [ ] success。
   - [ ] failed package。
@@ -102,15 +102,15 @@
   - [ ] disk full。
   - [ ] compile error。
 - [ ] 支援 artifact detection：
-  - [ ] glob。
+  - [x] glob。
   - [ ] regex。
-  - [ ] newest file。
-  - [ ] size threshold。
-  - [ ] checksum。
-- [ ] 支援 `docker cp` 匯出指定 firmware。
+  - [x] newest file。
+  - [x] size threshold。
+  - [x] checksum。
+- [x] 支援 `docker cp` 匯出指定 firmware。
 - [ ] 建立 artifact metadata：
-  - [ ] image path。
-  - [ ] SHA256。
+  - [x] image path。
+  - [x] SHA256。
   - [ ] build timestamp。
   - [ ] git commit if available。
   - [ ] OpenWrt target/subtarget/profile。
@@ -307,4 +307,3 @@
 - [ ] Write safe firmware upgrade guide。
 - [ ] Define versioning policy。
 - [ ] Produce first tagged release。
-

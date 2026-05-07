@@ -15,8 +15,8 @@ bin/
 coverage.out
 
 # Local runtime
-artifacts/
-logs/
+/artifacts/
+/logs/
 *.db
 *.sqlite
 *.sqlite3
@@ -27,4 +27,3 @@ logs/
 # Editors
 .idea/
 .vscode/
-
