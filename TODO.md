@@ -210,7 +210,7 @@
   - [x] cancel job（`POST /v1/jobs/{id}/cancel` 寫 `cancel.flag` marker 進 run_dir，跟 Python `cancel` CLI 同一機制；workflow 主動 poll 該 marker，cooperatively abort）。
   - [x] stream logs（`GET /v1/jobs/{id}/events` 回 events.jsonl raw stream，`application/x-ndjson` content-type；live-tail 留待之後）。
   - [x] query status（`GET /v1/jobs?limit=N` newest-first list；`GET /v1/jobs/{id}` 回完整 report.json；orphan / 損毀 report 自動 skip）。
-  - [ ] list DUT locks（需要從 SQLite 讀 `dut_locks` / `builder_locks`；目前 Go 不開 SQLite）。
+  - [x] list DUT locks（`GET /v1/locks` 讀 `<artifacts_dir>/locks.json`；Python `JobStore` 在每個 lock acquire/release/heartbeat 後 atomic 寫一份 snapshot；Go 端不開 SQLite，無新 dep）。
   - [x] list artifacts（兩條路徑：`GET /v1/jobs/{id}` 含 `artifact` 欄位；`GET /v1/jobs/{id}/files/<path>` 用 `http.FileServer(http.Dir(<job_dir>))` 直接 serve build.log/serial.log/firmware/*.bin，path-traversal 由 stdlib FileServer 守住）。
 - [x] 支援 JSONL or gRPC streaming（events.jsonl 已 stream；gRPC 與 live tail 留待之後）。
 - [ ] Go 負責長時間穩定工作（write side 整批留待之後）：

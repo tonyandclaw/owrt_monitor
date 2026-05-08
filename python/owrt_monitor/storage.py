@@ -121,6 +121,7 @@ class JobStore:
         owner_job_id: str,
         lock_timeout_sec: int | None = None,
     ) -> bool:
+        acquired = False
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -145,6 +146,9 @@ class JobStore:
                 (builder_name, owner_job_id, _now(), _now()),
             )
             connection.commit()
+            acquired = True
+        if acquired:
+            self._refresh_locks_snapshot()
         return True
 
     def release_builder_lock(self, *, builder_name: str, owner_job_id: str) -> None:
@@ -156,6 +160,7 @@ class JobStore:
                 """,
                 (builder_name, owner_job_id),
             )
+        self._refresh_locks_snapshot()
 
     def builder_lock_owner(self, builder_name: str) -> str | None:
         with self._connect() as connection:
@@ -196,6 +201,7 @@ class JobStore:
                 (dut_name, owner_job_id, _now(), _now()),
             )
             connection.commit()
+        self._refresh_locks_snapshot()
         return True
 
     def heartbeat_dut_lock(self, *, dut_name: str, owner_job_id: str) -> None:
@@ -208,6 +214,7 @@ class JobStore:
                 """,
                 (_now(), dut_name, owner_job_id),
             )
+        self._refresh_locks_snapshot()
 
     def release_dut_lock(self, *, dut_name: str, owner_job_id: str) -> None:
         with self._connect() as connection:
@@ -218,6 +225,53 @@ class JobStore:
                 """,
                 (dut_name, owner_job_id),
             )
+        self._refresh_locks_snapshot()
+
+    def _refresh_locks_snapshot(self) -> None:
+        """Atomically write `<db_dir>/locks.json` with the current lock state.
+
+        Companion file for the Go owrtd `GET /v1/locks` endpoint — keeps the
+        Go side dep-free (no SQLite driver) at the cost of one tiny file
+        rewrite per lock mutation. Atomic via os.replace so the daemon
+        never sees a torn read.
+        """
+        try:
+            with self._connect() as connection:
+                duts = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT dut_name, owner_job_id, created_at, heartbeat_at "
+                        "FROM dut_locks ORDER BY dut_name"
+                    ).fetchall()
+                ]
+                builders = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT builder_name, owner_job_id, created_at, heartbeat_at "
+                        "FROM builder_locks ORDER BY builder_name"
+                    ).fetchall()
+                ]
+        except sqlite3.Error:
+            return  # snapshot is best-effort; never fail the caller
+        payload = {
+            "generated_at": _now(),
+            "dut_locks": duts,
+            "builder_locks": builders,
+        }
+        snapshot_path = self.path.parent / "locks.json"
+        tmp_path = snapshot_path.with_suffix(".json.tmp")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            tmp_path.replace(snapshot_path)
+        except OSError:
+            # Snapshot is best-effort; SQLite remains the source of truth.
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
     def record_test_result(
         self,

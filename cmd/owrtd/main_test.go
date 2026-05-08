@@ -364,6 +364,84 @@ func TestJobEventsReturns404WhenAbsent(t *testing.T) {
 	}
 }
 
+func TestLocksReturnsEmptyWhenSnapshotMissing(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/locks", nil)
+	rec := httptest.NewRecorder()
+	srv.handleLocks(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if duts, _ := body["dut_locks"].([]any); len(duts) != 0 {
+		t.Fatalf("want empty dut_locks, got %v", duts)
+	}
+}
+
+func TestLocksReadsSnapshot(t *testing.T) {
+	srv, dir := newTestServer(t)
+	snapshot := []byte(`{
+  "generated_at": "2026-05-08T03:14:15+00:00",
+  "dut_locks": [
+    {"dut_name": "dut-01", "owner_job_id": "job_abc", "created_at": "x", "heartbeat_at": "y"}
+  ],
+  "builder_locks": []
+}`)
+	if err := os.WriteFile(filepath.Join(dir, "locks.json"), snapshot, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/locks", nil)
+	rec := httptest.NewRecorder()
+	srv.handleLocks(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	duts := body["dut_locks"].([]any)
+	if len(duts) != 1 {
+		t.Fatalf("want 1 dut_lock, got %d", len(duts))
+	}
+	first := duts[0].(map[string]any)
+	if first["dut_name"] != "dut-01" {
+		t.Fatalf("want dut-01, got %v", first["dut_name"])
+	}
+	if first["owner_job_id"] != "job_abc" {
+		t.Fatalf("want job_abc, got %v", first["owner_job_id"])
+	}
+}
+
+func TestLocksRejectsBadSnapshotJSON(t *testing.T) {
+	srv, dir := newTestServer(t)
+	if err := os.WriteFile(filepath.Join(dir, "locks.json"),
+		[]byte("not json {"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/locks", nil)
+	rec := httptest.NewRecorder()
+	srv.handleLocks(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d", rec.Code)
+	}
+}
+
+func TestLocksPostReturns405(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/locks", nil)
+	rec := httptest.NewRecorder()
+	srv.handleLocks(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+}
+
 func TestIsSafeJobID(t *testing.T) {
 	cases := map[string]bool{
 		"job_abc123":          true,

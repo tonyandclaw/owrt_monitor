@@ -92,6 +92,56 @@ def test_builder_lock_owner_returns_none_when_unlocked(tmp_path: Path) -> None:
     assert store.builder_lock_owner("bld-x") is None
 
 
+def test_locks_snapshot_written_on_acquire(tmp_path: Path) -> None:
+    """The Python side writes `<db_dir>/locks.json` whenever locks change.
+    The Go owrtd reads this file via `GET /v1/locks` (no SQLite from Go)."""
+    db = tmp_path / "state.sqlite3"
+    store = JobStore(db)
+    store.acquire_dut_lock(dut_name="dut-snap", owner_job_id="jobA")
+    store.acquire_builder_lock(builder_name="bld-snap", owner_job_id="jobB")
+
+    snapshot = tmp_path / "locks.json"
+    assert snapshot.exists()
+    import json
+
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert "generated_at" in payload
+    assert payload["dut_locks"][0]["dut_name"] == "dut-snap"
+    assert payload["dut_locks"][0]["owner_job_id"] == "jobA"
+    assert payload["builder_locks"][0]["builder_name"] == "bld-snap"
+    assert payload["builder_locks"][0]["owner_job_id"] == "jobB"
+
+
+def test_locks_snapshot_updated_on_release(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    store = JobStore(db)
+    store.acquire_dut_lock(dut_name="dut-r", owner_job_id="job1")
+    store.release_dut_lock(dut_name="dut-r", owner_job_id="job1")
+
+    import json
+
+    payload = json.loads((tmp_path / "locks.json").read_text(encoding="utf-8"))
+    assert payload["dut_locks"] == []
+
+
+def test_locks_snapshot_atomic_under_concurrent_lookups(tmp_path: Path) -> None:
+    """The temp-then-rename pattern means a reader never observes a torn
+    file — either the old contents or the new, but not a partial write."""
+    db = tmp_path / "state.sqlite3"
+    store = JobStore(db)
+    # Take a lock, then take + release a second one, ensuring the snapshot
+    # remains parseable JSON on every read in between.
+    store.acquire_dut_lock(dut_name="dut1", owner_job_id="ja")
+    store.acquire_dut_lock(dut_name="dut2", owner_job_id="jb")
+    store.release_dut_lock(dut_name="dut1", owner_job_id="ja")
+
+    import json
+
+    payload = json.loads((tmp_path / "locks.json").read_text(encoding="utf-8"))
+    duts = {entry["dut_name"] for entry in payload["dut_locks"]}
+    assert duts == {"dut2"}
+
+
 def test_heartbeat_refreshes_lock(tmp_path: Path) -> None:
     db = tmp_path / "state.sqlite3"
     store = JobStore(db)

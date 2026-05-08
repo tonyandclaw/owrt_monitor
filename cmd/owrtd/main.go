@@ -13,6 +13,7 @@
 //   GET  /v1/jobs/{id}/events               → raw events.jsonl bytes
 //   GET  /v1/jobs/{id}/files/<path>         → serve files from the run_dir
 //   POST /v1/jobs/{id}/cancel               → write cancel.flag marker
+//   GET  /v1/locks                          → current DUT + builder locks
 //   POST /v1/jobs                           → 501 stub (submit-job reserved)
 //
 // Storage of truth is the on-disk run directories. SQLite is intentionally
@@ -76,8 +77,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/v1/jobs", srv.handleJobs)
-	// `/v1/jobs/{id}` and `/v1/jobs/{id}/events` are dispatched by handleJobByID.
+	// `/v1/jobs/{id}` and its sub-resources are dispatched by handleJobByID.
 	mux.HandleFunc("/v1/jobs/", srv.handleJobByID)
+	mux.HandleFunc("/v1/locks", srv.handleLocks)
 
 	// owrtd is intended for localhost-only access (default 127.0.0.1) and
 	// reads from the same machine's filesystem; it does not handle traffic
@@ -99,6 +101,41 @@ func main() {
 
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
+}
+
+// handleLocks reads `<artifactsDir>/locks.json` (Python writes it on every
+// lock mutation) and surfaces the current DUT + builder lock state. Going
+// through a JSON snapshot file rather than opening SQLite from Go keeps the
+// daemon dep-free.
+func (s *server) handleLocks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+		return
+	}
+	path := filepath.Join(s.artifactsDir, "locks.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// No locks ever taken in this artifacts dir — return an empty
+			// payload so a UI doesn't have to special-case "first run".
+			writeJSON(w, http.StatusOK, map[string]any{
+				"generated_at":  "",
+				"dut_locks":     []any{},
+				"builder_locks": []any{},
+			})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{
+			Error: fmt.Sprintf("locks.json is not valid JSON: %v", err),
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
