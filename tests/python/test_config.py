@@ -8,7 +8,7 @@ def test_load_example_config() -> None:
     config = load_config(Path("configs/example.yaml"))
 
     assert config.project.name == "owrt-monitor-lab"
-    assert config.builder.container == "openwrt-builder"
+    assert config.builder.container == "openwrtbuild"
     assert config.artifact.selection == "newest"
 
 

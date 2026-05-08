@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import socket
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 
 class FirmwareServerError(RuntimeError):
@@ -27,8 +28,40 @@ class TemporaryFirmwareServer:
         return int(self._server.server_address[1])
 
     def start(self) -> None:
+        directory = self.directory
+
+        class _ChecksumHandler(SimpleHTTPRequestHandler):
+            """`SimpleHTTPRequestHandler` plus a `<file>.sha256` endpoint.
+
+            For any path ending in `.sha256`, computes the SHA256 of the
+            corresponding file in `directory` on demand. Useful for clients
+            that want to verify the download without re-implementing their
+            own checksum capture from the wget output.
+            """
+
+            def do_GET(self_inner) -> None:  # noqa: N805
+                parsed = urlparse(self_inner.path)
+                path = unquote(parsed.path)
+                if path.endswith(".sha256"):
+                    target = directory / Path(path[1:]).name[: -len(".sha256")]
+                    if target.is_file():
+                        digest = hashlib.sha256()
+                        with target.open("rb") as fh:
+                            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                                digest.update(chunk)
+                        body = f"{digest.hexdigest()}  {target.name}\n".encode()
+                        self_inner.send_response(200)
+                        self_inner.send_header("Content-Type", "text/plain")
+                        self_inner.send_header("Content-Length", str(len(body)))
+                        self_inner.end_headers()
+                        self_inner.wfile.write(body)
+                        return
+                    self_inner.send_error(404, f"no such file: {target.name}")
+                    return
+                super().do_GET()
+
         handler = functools.partial(
-            SimpleHTTPRequestHandler,
+            _ChecksumHandler,
             directory=str(self.directory),
         )
         try:

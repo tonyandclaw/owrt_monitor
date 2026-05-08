@@ -1,0 +1,246 @@
+fatal: No names found, cannot describe anything.
+make -Orecurse -j 6 -C /home/asus/openwrt/enw-device-firmware/build/owrt2102 world V=
+make[1]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[2]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[3]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[3]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+
+
+make[3]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[3]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[2]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+ make[2] world
+ make[3] package/cleanup
+ make[3] target/compile
+ make[4] -C target/linux compile
+ make[3] buildinfo
+ make[3] package/compile
+ make[4] diffconfig buildversion feedsversion
+ make[4] -C package/libs/libjson-c host-compile
+ make[4] -C feeds/packages/libs/libaio host-compile
+ make[4] -C package/libs/libiconv host-compile
+ make[4] -C package/utils/dtc host-compile
+ make[4] -C package/libs/toolchain compile
+ make[4] -C package/libs/ncurses host-compile
+ make[4] -C package/system/fwtool host-compile
+ make[4] -C package/system/usign host-compile
+ make[4] -C feeds/packages/lang/perl host-compile
+ make[4] -C feeds/packages/devel/ninja host-compile
+ make[4] -C package/utils/lua host-compile
+ make[4] -C feeds/luci/modules/luci-base host-compile
+ make[4] -C feeds/luci/contrib/package/csstidy host-compile
+ make[4] -C package/libs/gettext-full host-compile
+ make[4] -C feeds/packages/libs/expat host-compile
+ make[4] -C feeds/packages/libs/libffi host-compile
+ make[4] -C package/utils/bzip2 host-compile
+ make[4] -C package/kernel/gpio-button-hotplug compile
+ make[4] -C package/mtk/drivers/mapfilter compile
+ make[4] -C package/mtk/drivers/mtfwd compile
+ make[4] -C package/mtk/drivers/mtqos compile
+ make[4] -C package/utils/e2fsprogs host-compile
+ make[4] -C package/libs/libubox host-compile
+ make[4] -C feeds/packages/utils/lvm2 host-compile
+ make[4] -C package/libs/popt host-compile
+ make[4] -C feeds/packages/devel/meson host-compile
+ make[4] -C feeds/packages/lang/python/python3 host-compile
+ make[4] -C package/system/opkg host-compile
+ make[4] -C feeds/packages/utils/cryptsetup host-compile
+ make[4] -C package/libs/libnl-tiny compile
+ make[4] -C package/libs/libjson-c compile
+ make[4] -C package/utils/lua compile
+ make[4] -C package/firmware/linux-firmware compile
+ make[4] -C package/firmware/prism54-firmware compile
+ make[4] -C package/libs/zlib compile
+ make[4] -C package/system/fwtool compile
+ make[4] -C package/system/ucert host-compile
+ make[4] -C package/system/openwrt-keyring compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/flatcc compile
+ make[4] -C package/libs/openssl compile
+ make[4] -C feeds/packages/devel/m4 compile
+ make[4] -C package/libs/gettext compile
+ make[4] -C package/libs/libiconv compile
+ make[4] -C feeds/packages/libs/gdbm compile
+ make[4] -C feeds/packages/devel/pkgconf compile
+ make[4] -C package/libs/libtool compile
+ make[4] -C package/system/ca-certificates compile
+ make[4] -C feeds/packages/libs/nghttp2 compile
+ make[4] -C package/libs/mbedtls compile
+ make[4] -C feeds/luci/libs/luci-lib-ip compile
+ make[4] -C feeds/luci/libs/luci-lib-jsonc compile
+ make[4] -C feeds/luci/libs/luci-lib-nixio compile
+ make[4] -C feeds/luci/contrib/package/lucihttp compile
+ make[4] -C feeds/luci/protocols/luci-proto-ppp compile
+ make[4] -C feeds/luci/themes/luci-theme-bootstrap compile
+ make[4] -C feeds/luci/protocols/luci-proto-ipv6 compile
+ make[4] -C feeds/packages/utils/attr compile
+ make[4] -C feeds/packages/libs/libffi compile
+ make[4] -C package/libs/gettext-full compile
+ make[4] -C package/libs/libnl compile
+ make[4] -C feeds/mtk/app/mii_mgr compile
+ make[4] -C feeds/mtk/app/switch compile
+ make[4] -C feeds/mtk/app/mt798x-2p5g-phy-firmware-internal compile
+ make[4] -C feeds/mtk/app/mtk_factory_rw compile
+ make[4] -C feeds/mtk/app/mtkhnat_util compile
+ make[4] -C feeds/mtk/app/regs compile
+ make[4] -C feeds/packages/libs/expat compile
+ make[4] -C feeds/packages/libs/libaio compile
+ make[4] -C feeds/packages/utils/hwdata compile
+ make[4] -C feeds/packages/lang/python/python-pip-conf compile
+ make[4] -C feeds/packages/libs/sqlite3 compile
+ make[4] -C feeds/packages/utils/xz compile
+ make[4] -C package/utils/bzip2 compile
+ make[4] -C feeds/packages/net/iperf compile
+ make[4] -C feeds/packages/net/iperf3 compile
+ make[4] -C feeds/packages/utils/kmod compile
+ make[4] -C feeds/packages/libs/libcap-ng compile
+ make[4] -C feeds/packages/net/linuxptp compile
+ make[4] -C package/libs/sysfsutils compile
+ make[4] -C package/libs/popt compile
+ make[4] -C feeds/packages/utils/lrzsz compile
+ make[4] -C package/utils/lua5.3 compile
+ make[4] -C feeds/packages/utils/mmc-utils compile
+ make[4] -C feeds/packages/utils/pciutils compile
+ make[4] -C feeds/packages/utils/picocom compile
+ make[4] -C package/libs/argp-standalone compile
+ make[4] -C package/libs/libmnl compile
+ make[4] -C package/devel/binutils compile
+ make[4] -C package/libs/gmp compile
+ make[4] -C feeds/packages/net/wsdd2 compile
+ make[4] -C package/libs/libpcap compile
+ make[4] -C package/network/utils/linux-atm compile
+ make[4] -C package/network/utils/resolveip compile
+ make[4] -C package/firmware/wireless-regdb compile
+ make[4] -C package/network/utils/iw compile
+ make[4] -C package/mtk/applications/datconf compile
+ make[4] -C package/mtk/applications/fwdd compile
+ make[4] -C package/mtk/applications/mwctl compile
+ make[4] -C package/mtk/applications/qtt_daemon compile
+ make[4] -C package/mtk/applications/sigma_daemon compile
+ make[4] -C package/mtk/applications/sigma_dut_v9.0.0 compile
+ make[4] -C package/mtk/applications/wificonf compile
+ make[4] -C package/network/services/dropbear compile
+ make[4] -C package/network/utils/ethtool compile
+ make[4] -C package/network/utils/tcpdump compile
+ make[4] -C package/network/utils/wireless-tools compile
+ make[4] -C package/libs/libsepol compile
+ make[4] -C package/libs/pcre compile
+ make[4] -C package/libs/musl-fts compile
+ make[4] -C package/libs/libubox compile
+ make[4] -C package/libs/ncurses compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/board-data compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/pal compile
+ make[4] -C feeds/packages/libs/libxml2 compile
+ make[4] -C package/libs/wolfssl compile
+ make[4] -C feeds/luci/libs/luci-lib-base compile
+ make[4] -C feeds/packages/libs/glib2 compile
+ make[4] -C feeds/mtk/app/ephy-utils compile
+ make[4] -C feeds/packages/utils/fio compile
+ make[4] -C feeds/packages/utils/lm-sensors compile
+ make[4] -C feeds/packages/utils/logrotate compile
+ make[4] -C feeds/packages/lang/luasocket compile
+ make[4] -C feeds/packages/utils/rng-tools compile
+ make[4] -C package/libs/elfutils compile
+ make[4] -C package/mtk/applications/luci-app-mtk compile
+ make[4] -C package/mtk/applications/spectrumd compile
+ make[4] -C package/network/ipv6/odhcp6c compile
+ make[4] -C package/system/mtd compile
+ make[4] -C package/libs/libselinux compile
+ make[4] -C package/system/ubus compile
+ make[4] -C package/system/urngd compile
+ make[4] -C package/system/uci compile
+ make[4] -C package/utils/util-linux compile
+ make[4] -C package/utils/jsonfilter compile
+ make[4] -C package/system/usign compile
+ make[4] -C package/utils/ucode compile
+ make[4] -C feeds/packages/libs/db47 compile
+ make[4] -C feeds/packages/net/curl compile
+ make[4] -C package/libs/readline compile
+ make[4] -C package/libs/ustream-ssl compile
+ make[4] -C package/network/utils/iwinfo compile
+ make[4] -C feeds/packages/net/cgi-io compile
+ make[4] -C package/network/services/uhttpd compile
+ make[4] -C feeds/packages/net/lftp compile
+ make[4] -C feeds/packages/utils/bash compile
+ make[4] -C package/network/utils/bpftools compile
+ make[4] -C package/network/services/hostapd compile
+ make[4] -C package/mtk/applications/ated_ext compile
+ make[4] -C package/mtk/drivers/wifi-profile compile
+ make[4] -C package/mtk/drivers/mt_spectrum compile
+ make[4] -C package/network/config/swconfig compile
+ make[4] -C package/network/services/dnsmasq compile
+ make[4] -C package/network/services/odhcpd compile
+ make[4] -C package/network/services/omcproxy compile
+ make[4] -C package/utils/busybox compile
+ make[4] -C package/utils/e2fsprogs compile
+ make[4] -C package/utils/f2fs-tools compile
+ make[4] -C package/network/config/netifd compile
+ make[4] -C package/system/ubox compile
+ make[4] -C package/utils/mtd-utils compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/wifi-common compile
+ make[4] -C feeds/packages/lang/perl compile
+ make[4] -C package/libs/uclient compile
+ make[4] -C package/system/rpcd compile
+ make[4] -C package/mtk/applications/libwpactrl compile
+ make[4] -C package/system/procd compile
+ make[4] -C package/system/urandom-seed compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/statsd compile
+ make[4] -C feeds/packages/devel/autoconf compile
+ make[4] -C package/system/opkg compile
+ make[4] -C feeds/luci/libs/rpcd-mod-luci compile
+ make[4] -C feeds/luci/libs/rpcd-mod-rrdns compile
+ make[4] -C package/mtk/applications/wappd compile
+ make[4] -C feeds/luci/applications/luci-app-opkg compile
+ make[4] -C feeds/packages/devel/automake compile
+ make[4] -C feeds/luci/modules/luci-base compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/tpm2-tss compile
+ make[4] -C feeds/packages/lang/python/python3 compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/tpm2-openssl compile
+ make[4] -C feeds/packages/utils/i2c-tools compile
+ make[4] -C feeds/packages/libs/libgpiod compile
+ make[4] -C package/kernel/linux compile
+ make[4] -C feeds/luci/modules/luci-mod-system compile
+ make[4] -C feeds/luci/modules/luci-mod-network compile
+ make[4] -C feeds/luci/modules/luci-mod-status compile
+ make[4] -C feeds/luci/modules/luci-compat compile
+ make[4] -C feeds/luci/modules/luci-mod-admin-full compile
+ make[4] -C package/network/utils/iptables compile
+ make[4] -C package/system/fstools compile
+ make[4] -C feeds/packages/kernel/ksmbd compile
+ make[4] -C feeds/mtk/kernel/pce compile
+ make[4] -C package/network/services/ppp compile
+ make[4] -C package/kernel/exfat compile
+ make[4] -C package/kernel/mac80211 compile
+ make[4] -C package/mtk/drivers/warp compile
+ make[4] -C package/network/config/gre compile
+ make[4] -C package/base-files compile
+ make[4] -C package/boot/uboot-envtools compile
+ make[4] -C package/network/config/firewall compile
+ make[4] -C feeds/packages/net/ksmbd-tools compile
+ make[4] -C feeds/mtk/kernel/crypto-eip compile
+ make[4] -C feeds/packages/net/miniupnpd compile
+ make[4] -C package/network/utils/iproute2 compile
+ make[4] -C feeds/packages/net/xl2tpd compile
+ make[4] -C package/mtk/applications/mtk-base-files compile
+ make[4] -C feeds/luci/applications/luci-app-firewall compile
+ make[4] -C feeds/luci/applications/luci-app-ksmbd compile
+ make[4] -C feeds/packages/net/strongswan compile
+ make[4] -C feeds/luci/collections/luci compile
+ make[4] -C package/mtk/drivers/mt_wifi_osal compile
+ make[4] -C package/mtk/drivers/mt_wifi7 compile
+ make[4] -C /home/asus/openwrt/enw-device-firmware/framework/common/asus/tpm2-tools compile
+ make[4] -C package/mtk/drivers/mt_hwifi compile
+ make[3] package/install
+ make[3] target/install
+ make[4] -C target/linux install
+ make[3] package/index
+ make[3] json_overview_image_info
+ make[3] checksum
+WARNING: Makefile 'package/feeds/mtk/flowtable/Makefile' has a dependency on 'kmod-nf-flow-netlink', which does not exist
+WARNING: Makefile 'package/kernel/mac80211/Makefile' has a dependency on 'kmod-qrtr-smd', which does not exist
+WARNING: Makefile 'package/kernel/mac80211/Makefile' has a dependency on 'kmod-qrtr-mhi', which does not exist
+WARNING: Makefile 'package/kernel/mac80211/Makefile' has a dependency on 'rtl8821ce-firmware', which does not exist
+WARNING: Makefile 'package/kernel/mac80211/Makefile' has a dependency on 'rtl8723de-firmware', which does not exist
+WARNING: Makefile 'package/feeds/mtk/tops-tool/Makefile' has a dependency on 'kmod-tops', which does not exist
+WARNING: Makefile 'package/mtk/drivers/warp/Makefile' has a dependency on 'kmod-hw_nat', which does not exist
+make[1]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+>>>> owrt2102.asus_mt_wifi7_mt7987  Build done in: 05:07.537

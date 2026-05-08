@@ -1,0 +1,22 @@
+fatal: No names found, cannot describe anything.
+cat: write error: No space left on device
+make -Orecurse -j 6 -C /home/asus/openwrt/enw-device-firmware/build/owrt2102 world V=
+make[1]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+config.guess: cannot create a temporary directory in /tmp
+config.guess: cannot create a temporary directory in /tmp
+config.guess: cannot create a temporary directory in /tmp
+awk: include/scan.awk:13: (FILENAME=- FNR=1776) fatal: print to "standard output" failed: No space left on device
+awk: (FILENAME=- FNR=37) warning: error writing standard output: No space left on device
+Unable to flush stdout: No space left on device
+Unable to flush stdout: No space left on device
+make[2]: *** [/home/asus/openwrt/enw-device-firmware/build/owrt2102/include/toplevel.mk:82: prepare-tmpinfo] Error 1
+make[1]: *** [/home/asus/openwrt/enw-device-firmware/build/owrt2102/include/toplevel.mk:228: world] Error 2
+make[2]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[3]: Entering directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[3]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+
+
+Failed to build tmp/.config-package.in
+make[2]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make[1]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
+make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2

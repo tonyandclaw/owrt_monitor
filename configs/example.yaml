@@ -2,19 +2,24 @@ project:
   name: owrt-monitor-lab
   artifact_dir: ../artifacts
 
+# Shared settings for all profiles. Per-board overrides go in `profiles:` below
+# and are deep-merged on top of these. Pick a profile with `--profile <name>`,
+# e.g. `owrt-monitor build --profile ap`.
 builder:
-  container: openwrt-builder
-  workdir: /work/openwrt
-  command:
-    - make
-    - -j8
+  container: openwrtbuild
+  workdir: /home/asus/openwrt/enw-device-firmware
+  # `command` is set per-profile (each board has its own make target).
+  command: [make]
   env:
     FORCE_UNSAFE_CONFIGURE: "1"
   timeout_sec: 0
 
 artifact:
-  patterns:
-    - bin/targets/**/**/openwrt-*-sysupgrade.bin
+  # enw-device-firmware writes per-profile output to build/<framework>/bin/target/
+  # (note: singular `target`, not vanilla OpenWrt's `bin/targets/<arch>/<sub>/`).
+  # `patterns` is set per-profile because each board class lives under a
+  # different framework subdir and emits a board-specific filename.
+  patterns: ["build/owrt2102/bin/target/openwrt-*-sysupgrade.bin"]
   selection: newest
   min_size_mb: 4
   require_sha256: true
@@ -51,7 +56,94 @@ upgrade:
 
 tests:
   command_timeout_sec: 30
+  # Each smoke entry is either a bare command string (passes if the command
+  # returns successfully) or a dict with a regex `expect` (passes only when the
+  # output matches). Regexes are Python `re` syntax, applied via `re.search`.
   smoke:
     - ubus call system board
     - opkg list-installed
     - /etc/init.d/network status
+    - command: cat /proc/uptime
+      expect: ^\d+\.\d+
+    - command: ip -j addr show br-lan
+      expect: '"operstate":"UP"'
+
+# Per-board overlays. Each profile gets deep-merged onto the base above when
+# selected via `--profile <name>`. Lists (e.g. builder.command, artifact.patterns)
+# are replaced wholesale, scalars overwrite, and nested dicts merge key-by-key.
+profiles:
+  ap:
+    builder:
+      command: [make, owrt2102.asus_mt_wifi7_mt7987]
+    artifact:
+      # AP emits ~17 sysupgrade variants per build; pin to the eMMC variant.
+      patterns:
+        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin
+    upgrade:
+      # AP DUT pulls firmware over TFTP from the host's launchd-managed tftpd
+      # rooted at /private/tftpboot. The host IP the DUT can reach is fixed.
+      transfer: tftp
+      tftp_root: /private/tftpboot
+      tftp_host: 192.168.1.66
+      # Confirm the expected firmware actually booted — these regexes must all
+      # appear in the boot transcript before the shell prompt. Catches "wrong
+      # partition booted" or "stale firmware" cases the prompt regex alone misses.
+      expected_boot_markers:
+        - 'BusyBox v'
+        - 'OpenWrt'
+    dut:
+      # Defence in depth: AP and controller share build/owrt2102/, so a too-
+      # broad glob could pick the wrong board's image. This regex is checked
+      # against the selected artifact filename right before flashing.
+      expected_artifact_pattern: 'mediatek_mt7987a-emmc'
+
+  controller:
+    builder:
+      command: [make, owrt2102.asus_mt_controller_mt7988]
+    artifact:
+      patterns:
+        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7988*-sysupgrade.bin
+
+  switch:
+    builder:
+      command: [make, owrt2512.asus_microchipsw]
+    artifact:
+      patterns:
+        - build/owrt2512/bin/target/openwrt-*-sysupgrade.bin
+
+  ap-mt76:
+    # Earlier AP build using mt76 driver (owrt2410 framework).
+    builder:
+      command: [make, owrt2410.asus_mt76_mt7987]
+    artifact:
+      patterns:
+        - build/owrt2410/bin/target/openwrt-*-sysupgrade.bin
+
+  ap-recovery:
+    # Bootloader-TFTP recovery: when the AP DUT has lost its network and
+    # `sysupgrade` over the OpenWrt shell isn't possible. Sends `reboot` over
+    # serial, interrupts U-Boot autoboot with a space, then drives the
+    # standard `tftpboot + bootm` sequence. The boot is volatile — lost on
+    # next power cycle — so this is for testing a candidate firmware, not
+    # committing it. Use `ap` profile for permanent installs.
+    builder:
+      command: [make, owrt2102.asus_mt_wifi7_mt7987]
+    artifact:
+      patterns:
+        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin
+    upgrade:
+      transfer: bootloader_tftp
+      tftp_root: /private/tftpboot
+      tftp_host: 192.168.1.66
+      expected_boot_markers:
+        - 'BusyBox v'
+        - 'OpenWrt'
+      bootloader:
+        prompt: '=> '
+        interrupt_banner: 'Hit any key to stop autoboot'
+        interrupt_key: ' '
+        restart_command: reboot
+        load_address: '0x80000000'
+        boot_command: bootm
+    dut:
+      expected_artifact_pattern: 'mediatek_mt7987a-emmc'
