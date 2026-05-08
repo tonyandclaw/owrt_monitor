@@ -2,6 +2,24 @@
 
 這份 TODO 是以長期維護、穩定跑 OpenWrt build 與 DUT firmware upgrade/test 為目標。第一版可以先用 Python 做出完整 workflow；當流程穩定後，把長時間執行、process supervision、serial streaming、job cancellation 等部分逐步抽到 Go runner。
 
+## Status snapshot (as of 0.1.0)
+
+**Active scope: 224/252 = 88.9%.** Phases 0, 1, 2, 3, 4, 12 are at 100%.
+
+Each remaining open box falls into one of these buckets:
+
+- **DEFERRED (no current driver)**: Speculative additions whose use case hasn't materialised in the lab yet. Schema placeholders may exist; full implementation lands when the first real need shows up.
+  Examples: SCP / custom-command transfer, SSH-based smoke tests, host-side pytest runner.
+
+- **BLOCKED ON Phase 7 (Go runner write-side)**: Items that only make sense once Go takes over execution from Python. Today owrtd is a read-only companion (8/23 of Phase 7 done); the remaining 15 items need a daemon-takeover decision before they can land.
+  Examples: submit-job API, process supervision, log rotation, in-Go resource locks, daemon-restart recovery.
+
+- **NEEDS HARDWARE**: End-to-end test against a real DUT. CI fully covers the workflow with fakes (190 Python + 26 Go tests); real-hardware sign-off is a release gate, not a code-completion item.
+
+- **DEFERRED-BY-DESIGN**: Phase 8 (iTerm2/tmux observer) and Phase 9 (LLM assistance) are explicitly secondary per `ARCHITECTURE.md`. The deterministic workflow is the source of truth; observer/LLM layers are future enhancements.
+
+When opening a new slice, check this bucket first — most "open" items are deliberately on hold rather than just-not-done-yet.
+
 ## Phase 0 - Project Foundations
 
 - [x] 決定第一批支援平台：
@@ -204,8 +222,15 @@
 
 ## Phase 7 - Go Runner / Daemon
 
+> **Status: 8/23 done (read API complete).** owrtd is a working read-only
+> companion daemon; the remaining 15 boxes are the **write-side** —
+> daemonised job execution, in-Go process supervision, in-Go locks.
+> Each is multi-day work and depends on a one-time decision: does Go
+> take over from Python, or stay read-only? Until that decision is made,
+> these items are BLOCKED, not "just not yet done".
+
 - [x] 建立 `owrtd` Go daemon（read-only HTTP server，net/http stdlib only，無新 deps；`--addr` + `--artifacts-dir` flags；`http.Server{}` 含 read/write/idle timeouts）。
-- [ ] 提供本機 API：
+- [ ] 提供本機 API（BLOCKED on Phase 7 write-side decision）：
   - [ ] submit job（write side 留待後續，Python `BuildWorkflow.run` 是現行入口）。
   - [x] cancel job（`POST /v1/jobs/{id}/cancel` 寫 `cancel.flag` marker 進 run_dir，跟 Python `cancel` CLI 同一機制；workflow 主動 poll 該 marker，cooperatively abort）。
   - [x] stream logs（`GET /v1/jobs/{id}/events` 回 events.jsonl raw stream，`application/x-ndjson` content-type；live-tail 留待之後）。
@@ -230,33 +255,47 @@
 
 ## Phase 8 - iTerm2/tmux Observer
 
-- [ ] 不把 iTerm2 tab 當自動化核心。
-- [ ] 提供 tmux session observer：
+> **Status: DEFERRED-BY-DESIGN.** Per `ARCHITECTURE.md`, iTerm2/tmux is an observer
+> layer, not the automation core. The deterministic workflow (events.jsonl,
+> SQLite state, `report.json`) is the source of truth — terminal panes are
+> for human eyes only. Implementing the panes is post-stable-release polish.
+> A web dashboard talking to owrtd's read-only API is now a viable
+> alternative path that avoids AppleScript altogether.
+
+- [ ] 不把 iTerm2 tab 當自動化核心（design principle，不需 implementation；已遵守）。
+- [ ] 提供 tmux session observer（DEFERRED）：
   - [ ] build log pane。
   - [ ] serial log pane。
   - [ ] job status pane。
   - [ ] test result pane。
-- [ ] 可選 iTerm2 integration：
+- [ ] 可選 iTerm2 integration（DEFERRED）：
   - [ ] open named tabs。
   - [ ] attach logs。
   - [ ] jump to current job。
-- [ ] iTerm2 integration failure 不影響 build/flash/test。
+- [ ] iTerm2 integration failure 不影響 build/flash/test（design principle，N/A 直到 integration 真的存在）。
 
 ## Phase 9 - LLM Assistance
 
-- [ ] LLM 僅作為輔助分析，不直接執行 dangerous action。
-- [ ] 可用功能：
-  - [ ] summarize build failure。
-  - [ ] classify OpenWrt errors。
-  - [ ] suggest next action。
-  - [ ] generate bug report draft。
-  - [ ] summarize DUT boot failure。
-- [ ] LLM action guardrails：
+> **Status: DEFERRED-BY-DESIGN.** Per `ARCHITECTURE.md`, LLM is advisory only —
+> never authority. The build-log classifier (Phase 3) already handles the
+> common failure modes (disk_full, failed_package, compile_error) with
+> deterministic regex; LLM summaries are nice-to-have on top of that, not
+> a foundation. Wait until the deterministic baseline is exercised on real
+> hardware before adding inference into the loop.
+
+- [ ] LLM 僅作為輔助分析，不直接執行 dangerous action（design principle；deterministic config + workflow 永遠是 authority）。
+- [ ] 可用功能（DEFERRED）：
+  - [ ] summarize build failure（已有 build_log classifier；LLM 是 nice-to-have 的人類友善 summary）。
+  - [ ] classify OpenWrt errors（同上）。
+  - [ ] suggest next action（DEFERRED；可能跟 troubleshooting.md 的 recovery recipes 衝突，需要 careful design）。
+  - [ ] generate bug report draft（DEFERRED）。
+  - [ ] summarize DUT boot failure（DEFERRED；目前 BootFailureError 的 evidence + serial.log 已足夠人工 triage）。
+- [ ] LLM action guardrails（DEFERRED；上面任一功能落地時必須先實作這些）：
   - [ ] structured input only。
-  - [ ] no secret in prompt。
+  - [ ] no secret in prompt（已有 redacted_dump 機制可重用）。
   - [ ] dangerous command requires explicit approval。
-  - [ ] deterministic workflow remains source of truth。
-- [ ] 保存 LLM analysis 與原始 log 的對應關係。
+  - [ ] deterministic workflow remains source of truth（design principle；現行架構已遵守）。
+- [ ] 保存 LLM analysis 與原始 log 的對應關係（DEFERRED）。
 
 ## Phase 10 - Reliability and Operations
 
