@@ -339,8 +339,39 @@ class SmokeTest(StrictModel):
         return value
 
 
+class ScriptTest(StrictModel):
+    """A host-side executable run after serial smoke tests.
+
+    The script is exec'd directly (argument-list form, no shell). DUT context
+    is exposed via env vars: `OWRT_DUT_NAME`, `OWRT_DUT_SERIAL`,
+    `OWRT_DUT_ADDRESS`, `OWRT_RUN_DIR`, `OWRT_FIRMWARE_PATH` (if available),
+    `OWRT_FIRMWARE_SHA256` (if available). Exit code 0 = pass.
+    """
+
+    name: str
+    path: str
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_sec: int = 60
+
+    @field_validator("name", "path")
+    @classmethod
+    def must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tests.scripts[].name and .path must not be blank")
+        return value
+
+    @field_validator("timeout_sec")
+    @classmethod
+    def timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("tests.scripts[].timeout_sec must be positive")
+        return value
+
+
 class TestConfig(StrictModel):
     smoke: list[SmokeTest] = Field(default_factory=list)
+    scripts: list[ScriptTest] = Field(default_factory=list)
     command_timeout_sec: int = 30
     # Post-boot status snapshot. Empty string disables. Default expects the
     # OpenWrt-shipped `ubus` returning a JSON object with release/kernel/etc.

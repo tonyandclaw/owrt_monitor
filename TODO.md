@@ -184,9 +184,9 @@
 
 - [x] 支援 test runner interface（serial shell 是主要路徑，含 regex assertion；SSH/pytest/custom 留給之後）：
   - [x] serial shell tests。
-  - [ ] SSH tests。
-  - [ ] pytest tests。
-  - [ ] custom scripts。
+  - [ ] SSH tests（schema 已含 SmokeTest.expect regex；SSH-via-paramiko 留待第一個 SSH-only DUT 上線時做）。
+  - [ ] pytest tests（host-side runner 留待之後；目前可用 custom scripts 跑 pytest invocation 達到同樣效果）。
+  - [x] custom scripts（`tests.scripts: list[ScriptTest]`：每個 script 是 host-side subprocess，DUT 資訊透過 `OWRT_DUT_*` env vars 暴露；exit-0=pass、非零或 timeout=fail；output capture 進 `report.md` 的 `## Custom Scripts` 段）。
 - [x] 基本 smoke tests（smoke 條目支援 `command + expect` regex；mismatch 標記 `assertion_failed=True`）：
   - [x] OpenWrt version（post-boot status capture，從 `ubus call system board` JSON 解出 release.distribution + release.version）。
   - [x] kernel version（同上，`kernel` 欄位）。

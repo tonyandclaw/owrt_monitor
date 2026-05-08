@@ -198,6 +198,7 @@ class BuildWorkflow:
 
             metrics: dict[str, float] = {}
             dut_status: dict[str, object] = {}
+            script_results: list = []
             if report.build_summary and report.build_summary.get("duration_sec") is not None:
                 metrics["build_duration_sec"] = float(report.build_summary["duration_sec"])
             if allow_flash:
@@ -213,12 +214,15 @@ class BuildWorkflow:
                     ),
                     metrics=metrics,
                     status_out=dut_status,
+                    script_results_out=script_results,
                 )
                 report.test_results = [asdict(result) for result in test_results]
             if metrics:
                 report.metrics = dict(metrics)
             if dut_status:
                 report.dut_status = dict(dut_status)
+            if script_results:
+                report.script_results = [asdict(r) for r in script_results]
 
             report.state = JobState.SUCCEEDED.value
             report.success = True
@@ -434,6 +438,7 @@ class BuildWorkflow:
 
             resume_metrics: dict[str, float] = {}
             resume_status: dict[str, object] = {}
+            resume_scripts: list = []
             if allow_flash:
                 _assert_artifact_matches_dut(resumed_config, exported)
                 test_results = dut_workflow.execute_upgrade_and_tests(
@@ -447,12 +452,15 @@ class BuildWorkflow:
                     ),
                     metrics=resume_metrics,
                     status_out=resume_status,
+                    script_results_out=resume_scripts,
                 )
                 report.test_results = [asdict(result) for result in test_results]
             if resume_metrics:
                 report.metrics = dict(resume_metrics)
             if resume_status:
                 report.dut_status = dict(resume_status)
+            if resume_scripts:
+                report.script_results = [asdict(r) for r in resume_scripts]
 
             report.state = JobState.SUCCEEDED.value
             report.success = True
@@ -827,6 +835,7 @@ class FlashWorkflow:
             _assert_artifact_matches_dut(self.config, artifact)
             flash_metrics: dict[str, float] = {}
             flash_status: dict[str, object] = {}
+            flash_scripts: list = []
             test_results = dut_workflow.execute_upgrade_and_tests(
                 artifact,
                 transition=lambda state, message, fields: self._transition(
@@ -838,12 +847,15 @@ class FlashWorkflow:
                 ),
                 metrics=flash_metrics,
                 status_out=flash_status,
+                script_results_out=flash_scripts,
             )
             report.test_results = [asdict(result) for result in test_results]
             if flash_metrics:
                 report.metrics = dict(flash_metrics)
             if flash_status:
                 report.dut_status = dict(flash_status)
+            if flash_scripts:
+                report.script_results = [asdict(r) for r in flash_scripts]
             report.state = JobState.SUCCEEDED.value
             report.success = True
             self.store.update_job(

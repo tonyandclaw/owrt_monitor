@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -71,6 +73,19 @@ class SmokeTestResult:
     duration_sec: float
     assertion: str | None = None
     assertion_failed: bool = False
+
+
+@dataclass(frozen=True)
+class ScriptTestResult:
+    """One host-side script invocation outcome."""
+
+    name: str
+    path: str
+    passed: bool
+    exit_code: int
+    output: str
+    duration_sec: float
+    timed_out: bool = False
 
 
 StateTransition = Callable[[JobState, str, dict[str, object] | None], None]
@@ -166,6 +181,7 @@ class DutWorkflow:
         transition: StateTransition,
         metrics: dict[str, float] | None = None,
         status_out: dict[str, Any] | None = None,
+        script_results_out: list[ScriptTestResult] | None = None,
     ) -> list[SmokeTestResult]:
         transfer = self.config.upgrade.transfer
         if transfer not in {"http", "tftp", "bootloader_tftp"}:
@@ -339,6 +355,8 @@ class DutWorkflow:
             transition(JobState.TEST_RUNNING, "running smoke tests", None)
             smoke_started = time.monotonic()
             results = self.run_smoke_tests(session)
+            if script_results_out is not None:
+                script_results_out.extend(self.run_script_tests(artifact))
             if metrics is not None:
                 metrics["smoke_duration_sec"] = time.monotonic() - smoke_started
             return results
@@ -561,6 +579,112 @@ class DutWorkflow:
             },
         )
         return status
+
+    def run_script_tests(
+        self,
+        artifact: ExportedArtifact | None = None,
+    ) -> list[ScriptTestResult]:
+        """Run each `tests.scripts[]` entry as a host-side subprocess.
+
+        DUT context is exposed via env vars (`OWRT_DUT_NAME`, etc.) so scripts
+        can reach out to the device from outside (ping, HTTP API, WiFi assoc).
+        Each script's exit-0 is pass; non-zero or timeout is fail. Output is
+        captured into the report and the per-job log.
+        """
+        results: list[ScriptTestResult] = []
+        scripts = self.config.tests.scripts
+        if not scripts:
+            return results
+
+        base_env = self._script_env(artifact)
+        for script in scripts:
+            self._check_cancel()
+            env = {**base_env, **script.env}
+            cmd = [script.path, *script.args]
+            started = time.monotonic()
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=script.timeout_sec,
+                    check=False,
+                )
+                duration = time.monotonic() - started
+                results.append(
+                    ScriptTestResult(
+                        name=script.name,
+                        path=script.path,
+                        passed=completed.returncode == 0,
+                        exit_code=completed.returncode,
+                        output=(completed.stdout or "") + (completed.stderr or ""),
+                        duration_sec=duration,
+                    )
+                )
+            except subprocess.TimeoutExpired as exc:
+                duration = time.monotonic() - started
+                output = ""
+                if exc.stdout is not None:
+                    output += exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode(
+                        "utf-8", errors="replace"
+                    )
+                if exc.stderr is not None:
+                    output += exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(
+                        "utf-8", errors="replace"
+                    )
+                results.append(
+                    ScriptTestResult(
+                        name=script.name,
+                        path=script.path,
+                        passed=False,
+                        exit_code=-1,
+                        output=output or f"timed out after {script.timeout_sec}s",
+                        duration_sec=duration,
+                        timed_out=True,
+                    )
+                )
+            except OSError as exc:
+                results.append(
+                    ScriptTestResult(
+                        name=script.name,
+                        path=script.path,
+                        passed=False,
+                        exit_code=-1,
+                        output=f"failed to launch script: {exc}",
+                        duration_sec=time.monotonic() - started,
+                    )
+                )
+            self.logger.emit(
+                level="INFO" if results[-1].passed else "WARN",
+                component="tests",
+                event="script_test_completed",
+                message=(
+                    f"script `{script.name}` "
+                    f"{'passed' if results[-1].passed else 'failed'} "
+                    f"in {results[-1].duration_sec:.2f}s"
+                ),
+                fields={
+                    "name": script.name,
+                    "exit_code": results[-1].exit_code,
+                    "passed": results[-1].passed,
+                    "timed_out": results[-1].timed_out,
+                },
+            )
+        return results
+
+    def _script_env(self, artifact: ExportedArtifact | None) -> dict[str, str]:
+        env = dict(os.environ)
+        env["OWRT_DUT_NAME"] = self.config.dut.name
+        env["OWRT_DUT_SERIAL"] = self.config.dut.serial or ""
+        env["OWRT_DUT_ADDRESS"] = self.config.dut.network.address or ""
+        env["OWRT_RUN_DIR"] = str(self.run_dir)
+        env["OWRT_JOB_ID"] = self.job_id
+        if artifact is not None:
+            env["OWRT_FIRMWARE_PATH"] = str(artifact.host_path)
+            env["OWRT_FIRMWARE_SHA256"] = artifact.sha256
+            env["OWRT_FIRMWARE_FILENAME"] = artifact.filename
+        return env
 
     def _confirm_destructive_step(self, description: str) -> None:
         """Interactively confirm a destructive command when configured to.

@@ -25,6 +25,7 @@ class WorkflowReport:
     build_metadata: dict[str, Any] | None = None
     metrics: dict[str, Any] | None = None
     dut_status: dict[str, Any] | None = None
+    script_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -159,6 +160,26 @@ def _markdown_report(data: dict[str, Any]) -> str:
         if summary.get("warnings"):
             lines.extend(["", "### Build warnings", ""])
             lines.extend(f"- {w}" for w in summary["warnings"])
+
+    script_results = data.get("script_results") or []
+    if script_results:
+        passed = sum(1 for r in script_results if r["passed"])
+        total = len(script_results)
+        verdict = "PASS" if passed == total else "FAIL"
+        lines.extend([
+            "",
+            "## Custom Scripts",
+            "",
+            f"- Result: **{verdict}** ({passed}/{total} passed)",
+            "",
+        ])
+        for r in script_results:
+            status = "passed" if r["passed"] else "failed"
+            timeout_marker = " (TIMEOUT)" if r.get("timed_out") else ""
+            lines.append(
+                f"- `{r['name']}` [{r['path']}] exit={r['exit_code']}: "
+                f"{status}{timeout_marker} ({r['duration_sec']:.2f} s)"
+            )
 
     if data["test_results"]:
         results = data["test_results"]
