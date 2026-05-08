@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -236,6 +237,102 @@ func TestCancelGetReturns405(t *testing.T) {
 	seedJob(t, dir, "job_cancel_get1", map[string]any{"job_id": "job_cancel_get1"}, "")
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_cancel_get1/cancel", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+}
+
+func TestFilesServesBuildLog(t *testing.T) {
+	srv, dir := newTestServer(t)
+	jobID := "job_files_log123"
+	seedJob(t, dir, jobID, map[string]any{"job_id": jobID}, "")
+	if err := os.WriteFile(filepath.Join(dir, jobID, "build.log"),
+		[]byte("hello build log\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID+"/files/build.log", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "hello build log") {
+		t.Fatalf("body missing payload: %q", rec.Body.String())
+	}
+}
+
+func TestFilesServesNestedFirmware(t *testing.T) {
+	srv, dir := newTestServer(t)
+	jobID := "job_files_fw1234"
+	seedJob(t, dir, jobID, map[string]any{"job_id": jobID}, "")
+	fwDir := filepath.Join(dir, jobID, "firmware")
+	if err := os.MkdirAll(fwDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("FAKE_FIRMWARE_BYTES")
+	if err := os.WriteFile(filepath.Join(fwDir, "openwrt.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID+"/files/firmware/openwrt.bin", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body mismatch")
+	}
+}
+
+func TestFilesPathTraversalRejected(t *testing.T) {
+	srv, dir := newTestServer(t)
+	jobID := "job_files_trav1"
+	seedJob(t, dir, jobID, map[string]any{"job_id": jobID}, "")
+	// Place a sibling file outside the job dir; path traversal must NOT reach it.
+	sibling := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(sibling, []byte("SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, suffix := range []string{
+		"../secret.txt",
+		"..%2Fsecret.txt",
+		"foo/../../secret.txt",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/v1/jobs/"+jobID+"/files/"+suffix, nil)
+		rec := httptest.NewRecorder()
+		srv.handleJobByID(rec, req)
+		// http.FileServer either redirects or 404s; what matters is the
+		// secret content never appears in the response body.
+		if bytes.Contains(rec.Body.Bytes(), []byte("SECRET")) {
+			t.Fatalf("path traversal leaked secret for %q (status=%d body=%q)",
+				suffix, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestFilesReturns404WhenJobMissing(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_no_exist/files/anything", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", rec.Code)
+	}
+}
+
+func TestFilesPostReturns405(t *testing.T) {
+	srv, dir := newTestServer(t)
+	jobID := "job_files_post1"
+	seedJob(t, dir, jobID, map[string]any{"job_id": jobID}, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+jobID+"/files/build.log", nil)
 	rec := httptest.NewRecorder()
 	srv.handleJobByID(rec, req)
 	if rec.Code != http.StatusMethodNotAllowed {

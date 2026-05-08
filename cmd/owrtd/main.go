@@ -11,6 +11,7 @@
 //   GET  /v1/jobs?limit=N                   → [{job_id, ...}, ...]   (newest first)
 //   GET  /v1/jobs/{id}                      → full report.json
 //   GET  /v1/jobs/{id}/events               → raw events.jsonl bytes
+//   GET  /v1/jobs/{id}/files/<path>         → serve files from the run_dir
 //   POST /v1/jobs/{id}/cancel               → write cancel.flag marker
 //   POST /v1/jobs                           → 501 stub (submit-job reserved)
 //
@@ -163,19 +164,35 @@ func (s *server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch parts[1] {
+	// Some sub-resources (e.g. files/<path>) keep nested path components.
+	subhead, subtail, hasSubtail := strings.Cut(parts[1], "/")
+	switch subhead {
 	case "events":
+		if hasSubtail {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
+			return
+		}
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
 			return
 		}
 		s.serveEvents(w, jobID)
 	case "cancel":
+		if hasSubtail {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
+			return
+		}
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
 			return
 		}
 		s.serveCancel(w, jobID)
+	case "files":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+			return
+		}
+		s.serveFiles(w, r, jobID, subtail)
 	default:
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
 	}
@@ -208,6 +225,34 @@ func (s *server) serveReport(w http.ResponseWriter, jobID string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *server) serveFiles(w http.ResponseWriter, r *http.Request, jobID, subPath string) {
+	// http.FileServer + http.Dir is the standard way to serve a sandboxed
+	// directory tree. http.Dir.Open rejects requests that would escape the
+	// root via `..` segments — we still validate the job dir exists first
+	// to return a clean 404 instead of leaking that detail through the
+	// FileServer error.
+	jobDir := filepath.Join(s.artifactsDir, jobID)
+	info, err := os.Stat(jobDir)
+	if err != nil || !info.IsDir() {
+		writeJSON(w, http.StatusNotFound, errorResponse{
+			Error: "no such job (run directory does not exist)",
+		})
+		return
+	}
+	if subPath == "" {
+		// Treat /v1/jobs/{id}/files (no trailing path) as a directory listing.
+		subPath = "/"
+	}
+	// Re-shape the request URL so http.FileServer sees the path scoped
+	// inside the job dir. We don't mutate the original request — make a
+	// shallow copy with rewritten URL.path.
+	scoped := *r
+	urlCopy := *r.URL
+	urlCopy.Path = "/" + strings.TrimPrefix(subPath, "/")
+	scoped.URL = &urlCopy
+	http.FileServer(http.Dir(jobDir)).ServeHTTP(w, &scoped)
 }
 
 func (s *server) serveCancel(w http.ResponseWriter, jobID string) {

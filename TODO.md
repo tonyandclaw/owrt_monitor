@@ -211,7 +211,7 @@
   - [x] stream logs（`GET /v1/jobs/{id}/events` 回 events.jsonl raw stream，`application/x-ndjson` content-type；live-tail 留待之後）。
   - [x] query status（`GET /v1/jobs?limit=N` newest-first list；`GET /v1/jobs/{id}` 回完整 report.json；orphan / 損毀 report 自動 skip）。
   - [ ] list DUT locks（需要從 SQLite 讀 `dut_locks` / `builder_locks`；目前 Go 不開 SQLite）。
-  - [x] list artifacts（embedded in `GET /v1/jobs/{id}` 的 report.json `artifact` 欄位）。
+  - [x] list artifacts（兩條路徑：`GET /v1/jobs/{id}` 含 `artifact` 欄位；`GET /v1/jobs/{id}/files/<path>` 用 `http.FileServer(http.Dir(<job_dir>))` 直接 serve build.log/serial.log/firmware/*.bin，path-traversal 由 stdlib FileServer 守住）。
 - [x] 支援 JSONL or gRPC streaming（events.jsonl 已 stream；gRPC 與 live tail 留待之後）。
 - [ ] Go 負責長時間穩定工作（write side 整批留待之後）：
   - [ ] process supervision。
@@ -289,7 +289,7 @@
   - [ ] process runner（Phase 7 Go runner 實作後）。
   - [ ] log streaming（Phase 7）。
   - [ ] lock manager（Phase 7；目前 lock 邏輯在 Python 端 sqlite-backed）。
-  - [x] API handlers（`cmd/owrtd/main_test.go`：17 個 test 涵蓋 `/healthz`、`/v1/jobs?limit=`（limit 驗證、POST 501、newest-first 排序）、`/v1/jobs/{id}` 正常 + 404 + path-traversal 拒絕、`/v1/jobs/{id}/events` ndjson stream、`/v1/jobs/{id}/cancel` POST 202 + marker 檔內容、各 method 的 405、isSafeJobID 邊界、損毀 report.json 跳過；CI 跑 `go test ./...`）。
+  - [x] API handlers（`cmd/owrtd/main_test.go`：22 個 test 涵蓋 `/healthz`、`/v1/jobs?limit=`、`/v1/jobs/{id}`、`/v1/jobs/{id}/events`、`/v1/jobs/{id}/cancel`、`/v1/jobs/{id}/files/<path>`（含 nested firmware、path-traversal 三種 vector、404 missing、POST 405）、各 method gate、isSafeJobID 邊界、損毀 report.json 跳過；CI 跑 `go test ./...`）。
 - [x] Integration tests with fake DUT（`test_workflow_integration.py:test_build_workflow_full_flow_with_allow_flash`）：
   - [x] pseudo terminal（`_FakeSerialTransport` 注入到 `SerialSession`，跳過 pyserial）。
   - [x] simulated boot log（`b"rebooting\n" + prompt` 驅動 read_until 通過 reboot wait）。
