@@ -10,10 +10,16 @@
 
 主要文件：
 
+- [CHANGELOG.md](CHANGELOG.md): 版本更新紀錄；現行版本見 `owrt-monitor --version`。
 - [TODO.md](TODO.md): 長期實作 roadmap 與 checklist。
 - [ARCHITECTURE.md](ARCHITECTURE.md): 系統架構、資料流、模組邊界與穩定性設計。
 - [docs/quickstart.md](docs/quickstart.md): 目前 MVP 的安裝與操作方式。
 - [docs/config-reference.md](docs/config-reference.md): YAML config 欄位說明。
+- [docs/lab-setup.md](docs/lab-setup.md): 實機環境（builder container、TFTP、USB serial）需要怎麼準備。
+- [docs/safe-upgrade.md](docs/safe-upgrade.md): 真實 flash 前的 pre-flight checklist。
+- [docs/troubleshooting.md](docs/troubleshooting.md): 常見失敗（disk full、kernel panic、DUT lock 卡死、orphan job）的診斷與恢復。
+- [docs/adding-a-new-board.md](docs/adding-a-new-board.md): 新增一塊 board 的步驟。
+- [docs/versioning.md](docs/versioning.md): 版本控管政策、release 流程、deprecation 政策。
 
 ## Current MVP
 
