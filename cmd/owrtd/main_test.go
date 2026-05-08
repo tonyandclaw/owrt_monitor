@@ -191,6 +191,70 @@ func TestJobEventsStreamsRawJSONL(t *testing.T) {
 	}
 }
 
+func TestCancelWritesMarkerAndReturns202(t *testing.T) {
+	srv, dir := newTestServer(t)
+	seedJob(t, dir, "job_cancel_me1", map[string]any{"job_id": "job_cancel_me1"}, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_cancel_me1/cancel", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("want 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	// Marker file must exist on disk with the same shape Python writes.
+	marker := filepath.Join(dir, "job_cancel_me1", "cancel.flag")
+	contents, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatalf("marker file: %v", err)
+	}
+	if string(contents) != "requested\n" {
+		t.Fatalf("marker contents: want %q, got %q", "requested\n", string(contents))
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body["status"] != "cancellation requested" {
+		t.Fatalf("want cancellation requested, got %v", body["status"])
+	}
+}
+
+func TestCancelReturns404WhenJobDirMissing(t *testing.T) {
+	srv, _ := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_unknown/cancel", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", rec.Code)
+	}
+}
+
+func TestCancelGetReturns405(t *testing.T) {
+	srv, dir := newTestServer(t)
+	seedJob(t, dir, "job_cancel_get1", map[string]any{"job_id": "job_cancel_get1"}, "")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/job_cancel_get1/cancel", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+}
+
+func TestEventsPostReturns405(t *testing.T) {
+	srv, dir := newTestServer(t)
+	seedJob(t, dir, "job_events_post", map[string]any{"job_id": "job_events_post"}, "x\n")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/jobs/job_events_post/events", nil)
+	rec := httptest.NewRecorder()
+	srv.handleJobByID(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("want 405, got %d", rec.Code)
+	}
+}
+
 func TestJobEventsReturns404WhenAbsent(t *testing.T) {
 	srv, dir := newTestServer(t)
 	seedJob(t, dir, "job_no_events", map[string]any{"job_id": "job_no_events"}, "")

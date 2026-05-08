@@ -7,11 +7,12 @@
 // reserves the write-side (submit/cancel/lock) for a later milestone.
 //
 // Endpoints today:
-//   GET /healthz                       → {"status": "ok"}
-//   GET /v1/jobs?limit=N                → [{job_id, ...}, ...]   (newest first)
-//   GET /v1/jobs/{id}                   → full report.json
-//   GET /v1/jobs/{id}/events            → raw events.jsonl bytes
-//   GET /v1/jobs                        → 501 stub if unauthorised mutation
+//   GET  /healthz                          → {"status": "ok"}
+//   GET  /v1/jobs?limit=N                   → [{job_id, ...}, ...]   (newest first)
+//   GET  /v1/jobs/{id}                      → full report.json
+//   GET  /v1/jobs/{id}/events               → raw events.jsonl bytes
+//   POST /v1/jobs/{id}/cancel               → write cancel.flag marker
+//   POST /v1/jobs                           → 501 stub (submit-job reserved)
 //
 // Storage of truth is the on-disk run directories. SQLite is intentionally
 // not opened from Go: it would add a cgo or pure-Go dep we don't need until
@@ -129,13 +130,15 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entries)
 }
 
-// handleJobByID dispatches `/v1/jobs/{id}` and `/v1/jobs/{id}/events`.
+// handleJobByID dispatches `/v1/jobs/{id}` and its sub-resources.
+//
+// Method matrix:
+//
+//	GET  /v1/jobs/{id}             → report.json
+//	GET  /v1/jobs/{id}/events      → events.jsonl stream
+//	POST /v1/jobs/{id}/cancel      → write cancel.flag marker
+//	any other combination          → 404 or 405 with a JSON error body
 func (s *server) handleJobByID(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
-		return
-	}
-
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/jobs/")
 	if rest == "" {
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "missing job id"})
@@ -151,13 +154,28 @@ func (s *server) handleJobByID(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
+		// Bare /v1/jobs/{id} — GET only.
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+			return
+		}
 		s.serveReport(w, jobID)
 		return
 	}
 
 	switch parts[1] {
 	case "events":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
+			return
+		}
 		s.serveEvents(w, jobID)
+	case "cancel":
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
+			return
+		}
+		s.serveCancel(w, jobID)
 	default:
 		writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
 	}
@@ -190,6 +208,32 @@ func (s *server) serveReport(w http.ResponseWriter, jobID string) {
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *server) serveCancel(w http.ResponseWriter, jobID string) {
+	// The Python orchestrator polls `<run_dir>/cancel.flag` between every
+	// step. Writing the file is equivalent to `owrt-monitor cancel <id>` —
+	// no daemon-internal state needed, no new IPC mechanism.
+	jobDir := filepath.Join(s.artifactsDir, jobID)
+	info, err := os.Stat(jobDir)
+	if err != nil || !info.IsDir() {
+		writeJSON(w, http.StatusNotFound, errorResponse{
+			Error: "no such job (run directory does not exist)",
+		})
+		return
+	}
+	marker := filepath.Join(jobDir, "cancel.flag")
+	if err := os.WriteFile(marker, []byte("requested\n"), 0o644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{
+			Error: fmt.Sprintf("write cancel marker: %v", err),
+		})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id":      jobID,
+		"marker_path": marker,
+		"status":      "cancellation requested",
+	})
 }
 
 func (s *server) serveEvents(w http.ResponseWriter, jobID string) {
