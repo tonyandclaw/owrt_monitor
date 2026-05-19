@@ -64,6 +64,9 @@ def test_inspect_pulls_db_and_report_together(tmp_path: Path) -> None:
             },
             "metrics": {"build_duration_sec": 200, "boot_duration_sec": 30},
             "test_results": [{"command": "x", "passed": True}],
+            "script_results": [{"name": "script", "passed": True}],
+            "pytest_results": [{"name": "pytest", "passed": False, "skipped": True}],
+            "ssh_results": [{"name": "ssh", "passed": True}],
             "warnings": [],
         },
         metrics={"build_duration_sec": 200, "boot_duration_sec": 30},
@@ -77,6 +80,9 @@ def test_inspect_pulls_db_and_report_together(tmp_path: Path) -> None:
     assert insp.build_metadata["profile"] == "ap"
     assert insp.dut_status["kernel"] == "5.15.0"
     assert insp.metrics["boot_duration_sec"] == 30
+    assert insp.script_results == [{"name": "script", "passed": True}]
+    assert insp.pytest_results == [{"name": "pytest", "passed": False, "skipped": True}]
+    assert insp.ssh_results == [{"name": "ssh", "passed": True}]
 
 
 def test_inspect_works_when_report_json_missing(tmp_path: Path) -> None:
@@ -108,8 +114,12 @@ def test_diff_pairs_marks_differences(tmp_path: Path) -> None:
         report_payload={
             "artifact": {"sha256": "AAA", "size_bytes": 100, "filename": "f.bin"},
             "build_metadata": {"git_commit": "abc1234", "profile": "ap"},
-            "metrics": {"boot_duration_sec": 30.0},
+            "metrics": {"boot_duration_sec": 30.0, "test_duration_sec": 4.0},
             "dut_status": {"release": {"version": "22.03"}},
+            "test_results": [{"passed": True}],
+            "script_results": [{"passed": True}],
+            "pytest_results": [{"passed": False, "skipped": True}],
+            "ssh_results": [{"passed": True}],
         },
     )
     _seed_job(
@@ -117,8 +127,12 @@ def test_diff_pairs_marks_differences(tmp_path: Path) -> None:
         report_payload={
             "artifact": {"sha256": "BBB", "size_bytes": 105, "filename": "f.bin"},
             "build_metadata": {"git_commit": "def5678", "profile": "ap"},
-            "metrics": {"boot_duration_sec": 47.0},
+            "metrics": {"boot_duration_sec": 47.0, "test_duration_sec": 7.0},
             "dut_status": {"release": {"version": "23.05"}},
+            "test_results": [{"passed": False}],
+            "script_results": [{"passed": True}, {"passed": True}],
+            "pytest_results": [{"passed": True}],
+            "ssh_results": [{"passed": False, "skipped": True}],
         },
     )
     left = inspect_job(store, "job_old")
@@ -128,8 +142,13 @@ def test_diff_pairs_marks_differences(tmp_path: Path) -> None:
     assert pairs["provenance.profile"] == ("ap", "ap")  # same
     assert pairs["provenance.git_commit"] == ("abc1234", "def5678")
     assert pairs["dut.release.version"] == ("22.03", "23.05")
+    assert pairs["smoke.results"] == ("1/1", "0/1")
+    assert pairs["scripts.results"] == ("1/1", "2/2")
+    assert pairs["pytest.results"] == ("0/1, 1 skipped", "1/1")
+    assert pairs["ssh.results"] == ("1/1", "0/1, 1 skipped")
     # boot_duration_sec was a float; format applies
     assert pairs["metrics.boot_duration_sec"] == ("30.00", "47.00")
+    assert pairs["metrics.test_duration_sec"] == ("4.00", "7.00")
 
 
 def test_diff_pairs_handles_missing_fields_gracefully(tmp_path: Path) -> None:

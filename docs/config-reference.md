@@ -52,11 +52,11 @@ fail loudly at load time.
 
 ## upgrade
 
-- `transfer`: `http` (default) or `tftp`. `scp` and `custom` are reserved.
+- `transfer`: `http` (default), `scp`, `tftp`, `bootloader_tftp`, or `custom`.
 - `remote_path`: Firmware path on the DUT.
 - `command`: Upgrade command written to the DUT serial shell. **Destructive.**
 - `boot_timeout_sec`: Timeout while waiting for the prompt after the upgrade command.
-- `transfer_timeout_sec`: Timeout for the DUT firmware download command (`wget` or `tftp`).
+- `transfer_timeout_sec`: Timeout for the firmware transfer command.
 - `verify_sha256`: Run `sha256sum` on the DUT after transfer to confirm bytes match.
 - `min_dut_free_kb`: Minimum free KB at the firmware's remote directory before transfer.
   Default `0` (disabled). Threshold actually applied is `max(min_dut_free_kb, firmware_size_kb)`,
@@ -78,14 +78,71 @@ fail loudly at load time.
 - `tftp_root`: Host directory where the workflow `cp`s the firmware so the system tftpd can
   serve it. Default `/private/tftpboot` (macOS launchd-managed `tftpd`'s default root).
   Must already exist and be writable; the workflow will not create it.
-- `tftp_host`: Host IP reachable by the DUT for TFTP. Falls back to `http_host`, then to
-  inference from `dut.network.address`. The DUT command shape is
-  `tftp -g -r <filename> -l <remote_path> <tftp_host>` (BusyBox-friendly).
+- `tftp_host`: Host IP reachable by the DUT for TFTP and `bootloader_tftp`. Falls back
+  to `http_host`, then to inference from `dut.network.address`. The OpenWrt-shell TFTP
+  command shape is `tftp -g -r <filename> -l <remote_path> <tftp_host>` (BusyBox-friendly).
+- `network_recovery`: Optional runtime-only rescue before HTTP/TFTP transfer. When
+  `enabled: true`, the workflow pings `ping_host` (or the transfer host). If unreachable
+  and the configured interface is currently `proto dhcp`, it temporarily adds
+  `static_cidr` (for example `192.168.1.1/24`) to `interface`, verifies reachability,
+  transfers the firmware, then removes that temporary IP when `restore_after_transfer`
+  is true. Interfaces configured as static are left unchanged.
+
+### upgrade — SCP transfer
+
+- `scp_binary`: SCP executable. Default `scp`.
+- `scp_user`: Remote username. Default `root`.
+- `scp_host`: DUT host/IP for SCP. Falls back to `dut.network.address`.
+- `scp_port`: SSH/SCP port. Default `22`.
+- `scp_identity_file`: Optional identity file passed as `-i <path>`.
+- `scp_extra_args`: Extra arguments inserted before the source/target. For OpenWrt
+  Dropbear targets that do not support SFTP, set `scp_extra_args: ["-O"]` to force
+  legacy SCP mode on modern OpenSSH clients.
+
+### upgrade — custom transfer
+
+- `custom_transfer_command`: Host-side command as an argument array. Required when
+  `transfer: custom`. The command is executed directly, without an implicit shell, and
+  must place the firmware at `remote_path` on the DUT. The workflow still verifies size
+  and SHA256 over serial after the command returns.
+- Supported placeholders in each argument: `{artifact}` / `{artifact_path}` (host firmware
+  path), `{filename}`, `{sha256}`, `{size_bytes}`, `{remote_path}`, `{dut_name}`,
+  `{dut_serial}`, `{dut_address}`, `{run_dir}`, `{job_id}`.
+  Unknown placeholders fail config validation; use `{{` / `}}` when a literal brace
+  is needed inside an argument.
+
+Example:
+
+```yaml
+upgrade:
+  transfer: custom
+  remote_path: /tmp/firmware.bin
+  custom_transfer_command:
+    - sh
+    - -c
+    - 'my-transfer-tool "$1" "$2"'
+    - sh
+    - '{artifact}'
+    - '{dut_address}:{remote_path}'
+```
 
 ## tests
 
 - `smoke`: Serial shell commands to run after upgrade or through `owrt-monitor test`.
+- `scripts`: Host-side executables run after smoke tests. Each receives DUT/job context
+  through `OWRT_*` environment variables.
+- `pytest`: Host-side pytest invocations run as `<current Python> -m pytest <path> ...`
+  after smoke tests and custom scripts. Each entry accepts `name`, `path`, optional
+  `args`, optional `env`, optional `python`, and `timeout_sec`.
+- `ssh`: Host-side SSH checks run after smoke tests. Each entry accepts `name`,
+  `command`, optional `expect`, optional `host` (falls back to `dut.network.address`),
+  `user`, `port`, `identity_file`, `ssh_binary`, `extra_args`, and `timeout_sec`.
 - `command_timeout_sec`: Timeout for each smoke command.
+
+Every smoke/script/pytest/SSH entry accepts `enabled` (default `true`). Set
+`enabled: false` to keep the entry documented in config while recording it as skipped.
+Any failed smoke, script, pytest, or SSH result marks the job failed; reports keep all
+post-upgrade result sections so the failure evidence is still available.
 
 ## retry
 

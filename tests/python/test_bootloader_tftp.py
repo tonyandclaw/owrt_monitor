@@ -7,7 +7,10 @@ import yaml
 from fake_docker import FakeDockerBuildClient
 from owrt_monitor.config import ConfigError, load_config
 from owrt_monitor.dut_serial import SerialSession
+from owrt_monitor.dut_workflow import DutWorkflow
+from owrt_monitor.events import EventLogger
 from owrt_monitor.state import JobState
+from owrt_monitor.storage import JobStore
 from owrt_monitor.workflow import BuildWorkflow
 
 
@@ -170,6 +173,39 @@ def test_bootloader_tftp_dry_run_renders_plan(tmp_path: Path) -> None:
     assert "wget" not in md
     # The legacy `Upgrade command:` line is suppressed for bootloader_tftp.
     assert "sysupgrade -n" not in md
+
+
+def test_bootloader_tftp_prefers_tftp_host_without_network_inference(tmp_path: Path) -> None:
+    config_path = _write_bootloader_config(tmp_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["dut"].pop("network")
+    raw["upgrade"]["tftp_host"] = "198.51.100.66"
+    raw["upgrade"]["http_host"] = "198.51.100.99"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = load_config(config_path)
+    store = JobStore(tmp_path / "state.sqlite3")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    store.create_job(
+        job_id="job_bootloader_host",
+        config_path=config_path,
+        artifact_dir=run_dir,
+        state=JobState.PENDING.value,
+        config_snapshot=config.redacted_dump(),
+    )
+    workflow = DutWorkflow(
+        config=config,
+        run_dir=run_dir,
+        logger=EventLogger(
+            store=store,
+            job_id="job_bootloader_host",
+            path=run_dir / "events.jsonl",
+        ),
+        store=store,
+        job_id="job_bootloader_host",
+    )
+
+    assert workflow._firmware_host() == "198.51.100.66"
 
 
 def _write_bootloader_config(tmp_path: Path) -> Path:

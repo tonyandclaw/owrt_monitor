@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -18,6 +19,7 @@ from owrt_monitor.dut_serial import (
     BootFailureError,
     SerialError,
     SerialSession,
+    SerialTransport,
     discover_serial_ports,
 )
 from owrt_monitor.dut_status import DutStatus, parse_ubus_system_board
@@ -33,6 +35,139 @@ from owrt_monitor.transfer import (
 
 class DutWorkflowError(RuntimeError):
     """Raised when DUT upgrade or smoke testing cannot complete."""
+
+
+_SERIAL_COMMAND_ERROR_PATTERNS = [
+    re.compile(r"(?im)^(?:tftp|wget|sha256sum|/bin/ash|ash|test):\s+.+$"),
+    re.compile(
+        r"(?i)\b(network unreachable|no such file|can't open|unknown operand|"
+        r"permission denied|connection refused|bad address|not found)\b"
+    ),
+]
+
+
+@dataclass(frozen=True)
+class _NetworkRecoveryCleanup:
+    interface: str
+    static_cidr: str
+
+
+def _resolve_serial_path(serial: str | None, patterns: list[str]) -> str:
+    if serial:
+        return serial
+    ports = discover_serial_ports(patterns)
+    if not ports:
+        raise DutWorkflowError(
+            "no USB serial ports found; configure dut.serial or adjust dut.discovery_patterns"
+        )
+    if len(ports) > 1:
+        raise DutWorkflowError(
+            "multiple USB serial ports found; configure dut.serial explicitly: "
+            + ", ".join(ports)
+        )
+    return ports[0]
+
+
+def _configured_serial_session(
+    config: OwrtConfig,
+    transcript_path: Path,
+    *,
+    transport_factory: Callable[[], SerialTransport] | None = None,
+) -> SerialSession:
+    serial_path = _resolve_serial_path(config.dut.serial, config.dut.discovery_patterns)
+    newline = "\r\n" if config.dut.newline == "crlf" else "\n"
+    return SerialSession(
+        port=serial_path,
+        baud=config.dut.baud,
+        prompt=config.dut.prompt,
+        transcript_path=transcript_path,
+        newline=newline,
+        transport_factory=transport_factory,
+        bytesize=config.dut.bytesize,
+        parity=config.dut.parity,
+        stopbits=config.dut.stopbits,
+    )
+
+
+def _connect_session_with_optional_login(
+    config: OwrtConfig,
+    session: SerialSession,
+    *,
+    cancel_token: CancelToken | None = None,
+) -> None:
+    """Open serial, send a newline, and wait for shell/login prompts."""
+    session.connect()
+    session.send_newline()
+    timeout = config.dut.connect_timeout_sec
+    login = config.dut.login
+    prompt_re = re.compile(config.dut.prompt)
+
+    if login.password is None:
+        session.read_until(
+            prompt_re,
+            timeout_sec=timeout,
+            cancel_token=cancel_token,
+        )
+        return
+
+    sentinels = {
+        "shell": prompt_re,
+        "login": re.compile(r"[Ll]ogin:\s*$"),
+        "password": re.compile(r"[Pp]assword:\s*$"),
+    }
+    name, _ = session.read_until_one_of(
+        sentinels,
+        timeout_sec=timeout,
+        cancel_token=cancel_token,
+    )
+    if name == "shell":
+        return
+    if name == "login":
+        session.write_command(login.username)
+        name, _ = session.read_until_one_of(
+            {"shell": sentinels["shell"], "password": sentinels["password"]},
+            timeout_sec=timeout,
+            cancel_token=cancel_token,
+        )
+        if name == "shell":
+            return
+    # `name` is now "password" — either we hit it directly, or we sent a
+    # username and the device asked for a password.
+    session.write_command(login.password, redact_in_transcript=True)
+    session.read_until(
+        prompt_re,
+        timeout_sec=timeout,
+        cancel_token=cancel_token,
+    )
+
+
+def probe_serial_interactive(
+    config: OwrtConfig,
+    transcript_path: Path,
+    *,
+    cancel_token: CancelToken | None = None,
+    transport_factory: Callable[[], SerialTransport] | None = None,
+) -> str:
+    """Verify that the configured serial console reaches the configured prompt."""
+    session = _configured_serial_session(
+        config,
+        transcript_path,
+        transport_factory=transport_factory,
+    )
+    try:
+        _connect_session_with_optional_login(
+            config,
+            session,
+            cancel_token=cancel_token,
+        )
+        return session.port
+    except (SerialError, OSError) as exc:
+        raise DutWorkflowError(
+            f"serial console is not interactive on {session.port}: {exc}; "
+            f"expected prompt /{config.dut.prompt}/ after sending newline"
+        ) from exc
+    finally:
+        session.close()
 
 
 def _parse_busybox_df_avail_kb(output: str) -> int | None:
@@ -73,6 +208,7 @@ class SmokeTestResult:
     duration_sec: float
     assertion: str | None = None
     assertion_failed: bool = False
+    skipped: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,8 +222,41 @@ class ScriptTestResult:
     output: str
     duration_sec: float
     timed_out: bool = False
+    skipped: bool = False
 
 
+@dataclass(frozen=True)
+class PytestTestResult:
+    """One host-side pytest invocation outcome."""
+
+    name: str
+    path: str
+    passed: bool
+    exit_code: int
+    output: str
+    duration_sec: float
+    timed_out: bool = False
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class SshTestResult:
+    """One SSH post-upgrade command outcome."""
+
+    name: str
+    command: str
+    host: str
+    passed: bool
+    exit_code: int
+    output: str
+    duration_sec: float
+    assertion: str | None = None
+    assertion_failed: bool = False
+    timed_out: bool = False
+    skipped: bool = False
+
+
+HostTestResult = ScriptTestResult | PytestTestResult | SshTestResult
 StateTransition = Callable[[JobState, str, dict[str, object] | None], None]
 
 
@@ -117,6 +286,56 @@ class DutWorkflow:
         if self.cancel_token is not None:
             self.cancel_token.raise_if_cancelled()
 
+    def preflight_serial_interactive(self) -> str:
+        """Fail early unless the configured serial console reaches the shell prompt."""
+        if self._serial_session is not None:
+            self.logger.emit(
+                level="INFO",
+                component="dut",
+                event="serial_preflight_skipped",
+                message="serial prompt preflight skipped for injected serial session",
+                fields={"serial": self._serial_session.port},
+            )
+            return self._serial_session.port
+
+        if not self.store.acquire_dut_lock(
+            dut_name=self.config.dut.name,
+            owner_job_id=self.job_id,
+            lock_timeout_sec=self.config.dut.lock_timeout_sec,
+        ):
+            raise DutWorkflowError(f"DUT {self.config.dut.name} is already locked")
+
+        transcript_path = self.run_dir / "serial.preflight.log"
+        try:
+            self.logger.emit(
+                level="INFO",
+                component="dut",
+                event="serial_preflight_started",
+                message="checking DUT serial prompt before flash/test work",
+                fields={
+                    "serial": self.config.dut.serial or "<auto-discover>",
+                    "transcript": str(transcript_path),
+                },
+            )
+            port = probe_serial_interactive(
+                self.config,
+                transcript_path,
+                cancel_token=self.cancel_token,
+            )
+            self.logger.emit(
+                level="INFO",
+                component="dut",
+                event="serial_preflight_succeeded",
+                message="DUT serial prompt is interactive",
+                fields={"serial": port, "transcript": str(transcript_path)},
+            )
+            return port
+        finally:
+            self.store.release_dut_lock(
+                dut_name=self.config.dut.name,
+                owner_job_id=self.job_id,
+            )
+
     def planned_actions(self, artifact: ExportedArtifact | None = None) -> list[str]:
         serial = self.config.dut.serial or "<auto-discover>"
         filename = artifact.filename if artifact is not None else "<firmware>"
@@ -129,6 +348,15 @@ class DutWorkflow:
             actions.append(
                 f"Pre-flash gate: artifact filename must match "
                 f"`/{self.config.dut.expected_artifact_pattern}/`"
+            )
+        recovery = self.config.upgrade.network_recovery
+        if recovery.enabled:
+            probe_host = recovery.ping_host or self.config.upgrade.tftp_host or "<firmware-host>"
+            interface = recovery.interface or self.config.dut.network.interface or "<dut-interface>"
+            actions.append(
+                "Transfer network recovery: "
+                f"ping `{probe_host}`; if `{interface}` is DHCP and unreachable, "
+                f"temporarily add `{recovery.static_cidr}`"
             )
         if self.config.upgrade.transfer == "tftp":
             host = self.config.upgrade.tftp_host or self.config.upgrade.http_host or "<host-ip>"
@@ -154,6 +382,17 @@ class DutWorkflow:
                 f"setenv {bl.client_ip_env} <dut-ip>; "
                 f"tftpboot {bl.load_address} {filename}; {bl.boot_command}`"
             )
+        elif self.config.upgrade.transfer == "custom":
+            template = " ".join(
+                shlex.quote(part) for part in self.config.upgrade.custom_transfer_command
+            )
+            actions.append(f"Firmware transfer: custom host command `{template}`")
+        elif self.config.upgrade.transfer == "scp":
+            host = self.config.upgrade.scp_host or self.config.dut.network.address or "<dut-ip>"
+            target = f"{self.config.upgrade.scp_user}@{host}:{self.config.upgrade.remote_path}"
+            actions.append(
+                f"Firmware transfer: `scp {shlex.quote(filename)} {shlex.quote(target)}`"
+            )
         else:
             host = self.config.upgrade.http_host or "<host-ip>"
             url = f"http://{host}:<port>/{filename}"
@@ -168,10 +407,35 @@ class DutWorkflow:
                 + ", ".join(f"/{m}/" for m in self.config.upgrade.expected_boot_markers)
             )
         for entry in self.config.tests.smoke:
+            disabled = " (disabled)" if not entry.enabled else ""
             if entry.expect:
-                actions.append(f"Smoke test: `{entry.command}` (expect /{entry.expect}/)")
+                actions.append(
+                    f"Smoke test: `{entry.command}` (expect /{entry.expect}/){disabled}"
+                )
             else:
-                actions.append(f"Smoke test: `{entry.command}`")
+                actions.append(f"Smoke test: `{entry.command}`{disabled}")
+        for entry in self.config.tests.scripts:
+            command = " ".join(shlex.quote(part) for part in [entry.path, *entry.args])
+            disabled = " (disabled)" if not entry.enabled else ""
+            actions.append(f"Custom script: `{command}`{disabled}")
+        for entry in self.config.tests.pytest:
+            python = entry.python or sys.executable
+            command = " ".join(
+                shlex.quote(part) for part in [python, "-m", "pytest", entry.path, *entry.args]
+            )
+            disabled = " (disabled)" if not entry.enabled else ""
+            actions.append(f"Pytest: `{command}`{disabled}")
+        for entry in self.config.tests.ssh:
+            host = entry.host or self.config.dut.network.address or "<dut-ip>"
+            command = " ".join(
+                shlex.quote(part)
+                for part in [entry.ssh_binary, f"{entry.user}@{host}", entry.command]
+            )
+            disabled = " (disabled)" if not entry.enabled else ""
+            if entry.expect:
+                actions.append(f"SSH test: `{command}` (expect /{entry.expect}/){disabled}")
+            else:
+                actions.append(f"SSH test: `{command}`{disabled}")
         return actions
 
     def execute_upgrade_and_tests(
@@ -182,9 +446,11 @@ class DutWorkflow:
         metrics: dict[str, float] | None = None,
         status_out: dict[str, Any] | None = None,
         script_results_out: list[ScriptTestResult] | None = None,
+        pytest_results_out: list[PytestTestResult] | None = None,
+        ssh_results_out: list[SshTestResult] | None = None,
     ) -> list[SmokeTestResult]:
         transfer = self.config.upgrade.transfer
-        if transfer not in {"http", "tftp", "bootloader_tftp"}:
+        if transfer not in {"http", "scp", "tftp", "bootloader_tftp", "custom"}:
             raise DutWorkflowError(
                 f"transfer method {transfer!r} is not implemented yet"
             )
@@ -200,6 +466,7 @@ class DutWorkflow:
 
         session: SerialSession | None = None
         server: TemporaryFirmwareServer | None = None
+        network_cleanup: _NetworkRecoveryCleanup | None = None
 
         try:
             session = self._serial_session or self._create_serial_session()
@@ -211,8 +478,8 @@ class DutWorkflow:
                 {"serial": self.config.dut.serial},
             )
 
-            host = self._firmware_host()
             if transfer == "bootloader_tftp":
+                host = self._firmware_host()
                 self._publish_to_tftp_root(artifact)
                 source_descriptor = f"bootloader-tftp://{host}/{artifact.filename}"
                 self.logger.emit(
@@ -245,6 +512,7 @@ class DutWorkflow:
                 )
             else:
                 if transfer == "http":
+                    host = self._firmware_host()
                     server = self._firmware_server or TemporaryFirmwareServer(
                         directory=artifact.host_path.parent,
                         bind=self.config.upgrade.http_bind,
@@ -252,15 +520,23 @@ class DutWorkflow:
                     )
                     server.start()
                     source_url = server.url_for(artifact.filename, host=host)
-                    with_retry(
-                        "firmware_transfer",
-                        lambda: self._http_download_and_verify(session, artifact, source_url),
-                        policy=self.config.retry.firmware_transfer,
-                        cancel_token=self.cancel_token,
-                        logger=self.logger,
-                    )
+                    network_cleanup = self._prepare_transfer_network_recovery(session, host)
+                    try:
+                        with_retry(
+                            "firmware_transfer",
+                            lambda: self._http_download_and_verify(
+                                session, artifact, source_url
+                            ),
+                            policy=self.config.retry.firmware_transfer,
+                            cancel_token=self.cancel_token,
+                            logger=self.logger,
+                        )
+                    finally:
+                        self._cleanup_transfer_network_recovery(session, network_cleanup)
+                        network_cleanup = None
                     source_descriptor = source_url
-                else:  # tftp (OpenWrt-shell)
+                elif transfer == "tftp":
+                    host = self._firmware_host()
                     published_path = self._publish_to_tftp_root(artifact)
                     source_descriptor = f"tftp://{host}/{artifact.filename}"
                     self.logger.emit(
@@ -274,13 +550,36 @@ class DutWorkflow:
                             "size_bytes": artifact.size_bytes,
                         },
                     )
+                    network_cleanup = self._prepare_transfer_network_recovery(session, host)
+                    try:
+                        with_retry(
+                            "firmware_transfer",
+                            lambda: self._tftp_download_and_verify(session, artifact, host),
+                            policy=self.config.retry.firmware_transfer,
+                            cancel_token=self.cancel_token,
+                            logger=self.logger,
+                        )
+                    finally:
+                        self._cleanup_transfer_network_recovery(session, network_cleanup)
+                        network_cleanup = None
+                elif transfer == "scp":
                     with_retry(
                         "firmware_transfer",
-                        lambda: self._tftp_download_and_verify(session, artifact, host),
+                        lambda: self._scp_transfer_and_verify(session, artifact),
                         policy=self.config.retry.firmware_transfer,
                         cancel_token=self.cancel_token,
                         logger=self.logger,
                     )
+                    source_descriptor = self._scp_target()
+                else:  # custom host-side transfer command
+                    with_retry(
+                        "firmware_transfer",
+                        lambda: self._custom_transfer_and_verify(session, artifact),
+                        policy=self.config.retry.firmware_transfer,
+                        cancel_token=self.cancel_token,
+                        logger=self.logger,
+                    )
+                    source_descriptor = "custom://" + artifact.filename
                 self._check_cancel()
                 transition(
                     JobState.FIRMWARE_TRANSFERRED,
@@ -312,6 +611,8 @@ class DutWorkflow:
                     timeout_sec=self.config.upgrade.boot_timeout_sec,
                     cancel_token=self.cancel_token,
                     failure_patterns=failure_patterns,
+                    reconnect_on_error=True,
+                    newline_after_reconnect=True,
                 )
             except BootFailureError as exc:
                 self.logger.emit(
@@ -352,24 +653,52 @@ class DutWorkflow:
                 if status is not None:
                     status_out.update(status.to_dict())
 
-            transition(JobState.TEST_RUNNING, "running smoke tests", None)
-            smoke_started = time.monotonic()
+            transition(JobState.TEST_RUNNING, "running DUT tests", None)
+            test_started = time.monotonic()
             results = self.run_smoke_tests(session)
+            script_results = (
+                self.run_script_tests(artifact) if script_results_out is not None else []
+            )
+            pytest_results = (
+                self.run_pytest_tests(artifact) if pytest_results_out is not None else []
+            )
+            ssh_results = self.run_ssh_tests(artifact) if ssh_results_out is not None else []
             if script_results_out is not None:
-                script_results_out.extend(self.run_script_tests(artifact))
+                script_results_out.extend(script_results)
+            if pytest_results_out is not None:
+                pytest_results_out.extend(pytest_results)
+            if ssh_results_out is not None:
+                ssh_results_out.extend(ssh_results)
             if metrics is not None:
-                metrics["smoke_duration_sec"] = time.monotonic() - smoke_started
+                self._record_test_metrics(
+                    metrics=metrics,
+                    test_started=test_started,
+                    smoke_results=results,
+                    script_results=script_results,
+                    pytest_results=pytest_results,
+                    ssh_results=ssh_results,
+                )
             return results
         except (SerialError, FirmwareServerError, OSError) as exc:
             raise DutWorkflowError(str(exc)) from exc
         finally:
+            if session is not None and network_cleanup is not None:
+                self._cleanup_transfer_network_recovery(session, network_cleanup)
             if server is not None:
                 server.stop()
             if session is not None:
                 session.close()
             self.store.release_dut_lock(dut_name=self.config.dut.name, owner_job_id=self.job_id)
 
-    def execute_smoke_tests(self, *, transition: StateTransition) -> list[SmokeTestResult]:
+    def execute_smoke_tests(
+        self,
+        *,
+        transition: StateTransition,
+        script_results_out: list[ScriptTestResult] | None = None,
+        pytest_results_out: list[PytestTestResult] | None = None,
+        ssh_results_out: list[SshTestResult] | None = None,
+        metrics: dict[str, float] | None = None,
+    ) -> list[SmokeTestResult]:
         if not self.store.acquire_dut_lock(
             dut_name=self.config.dut.name,
             owner_job_id=self.job_id,
@@ -389,8 +718,28 @@ class DutWorkflow:
                 "DUT serial prompt is ready",
                 {"serial": self.config.dut.serial},
             )
-            transition(JobState.TEST_RUNNING, "running smoke tests", None)
-            return self.run_smoke_tests(session)
+            transition(JobState.TEST_RUNNING, "running DUT tests", None)
+            test_started = time.monotonic()
+            results = self.run_smoke_tests(session)
+            script_results = self.run_script_tests() if script_results_out is not None else []
+            pytest_results = self.run_pytest_tests() if pytest_results_out is not None else []
+            ssh_results = self.run_ssh_tests() if ssh_results_out is not None else []
+            if script_results_out is not None:
+                script_results_out.extend(script_results)
+            if pytest_results_out is not None:
+                pytest_results_out.extend(pytest_results)
+            if ssh_results_out is not None:
+                ssh_results_out.extend(ssh_results)
+            if metrics is not None:
+                self._record_test_metrics(
+                    metrics=metrics,
+                    test_started=test_started,
+                    smoke_results=results,
+                    script_results=script_results,
+                    pytest_results=pytest_results,
+                    ssh_results=ssh_results,
+                )
+            return results
         except (SerialError, OSError) as exc:
             raise DutWorkflowError(str(exc)) from exc
         finally:
@@ -411,6 +760,18 @@ class DutWorkflow:
                 self._check_cancel()
                 command = entry.command
                 expect = entry.expect
+                if not entry.enabled:
+                    results.append(
+                        SmokeTestResult(
+                            command=command,
+                            passed=False,
+                            output="skipped by config",
+                            duration_sec=0.0,
+                            assertion=expect,
+                            skipped=True,
+                        )
+                    )
+                    continue
                 started = time.monotonic()
                 try:
                     result = with_retry(
@@ -462,6 +823,145 @@ class DutWorkflow:
             if close_when_done:
                 active_session.close()
 
+    def _prepare_transfer_network_recovery(
+        self,
+        session: SerialSession,
+        firmware_host: str,
+    ) -> _NetworkRecoveryCleanup | None:
+        recovery = self.config.upgrade.network_recovery
+        if not recovery.enabled:
+            return None
+
+        ping_host = recovery.ping_host or firmware_host
+        interface = recovery.interface or self.config.dut.network.interface
+        if not interface:
+            self.logger.emit(
+                level="WARN",
+                component="dut",
+                event="network_recovery_skipped",
+                message="network recovery enabled but no interface was configured",
+                fields={"ping_host": ping_host},
+            )
+            return None
+
+        if self._serial_ping(session, ping_host):
+            self.logger.emit(
+                level="INFO",
+                component="dut",
+                event="network_recovery_not_needed",
+                message=f"DUT can reach {ping_host}",
+                fields={"ping_host": ping_host, "interface": interface},
+            )
+            return None
+
+        proto = self._network_proto_for_interface(session, interface)
+        if proto != "dhcp":
+            self.logger.emit(
+                level="WARN",
+                component="dut",
+                event="network_recovery_skipped",
+                message=(
+                    f"DUT cannot reach {ping_host}, but {interface} proto is "
+                    f"{proto or 'unknown'}; leaving it unchanged"
+                ),
+                fields={"ping_host": ping_host, "interface": interface, "proto": proto},
+            )
+            return None
+
+        cidr = recovery.static_cidr
+        quoted_interface = shlex.quote(interface)
+        quoted_cidr = shlex.quote(cidr)
+        session.run_command(
+            f"ip link set {quoted_interface} up; "
+            f"ip addr add {quoted_cidr} dev {quoted_interface} 2>/dev/null || true",
+            timeout_sec=self.config.dut.command_timeout_sec,
+            cancel_token=self.cancel_token,
+        )
+        cleanup = _NetworkRecoveryCleanup(interface=interface, static_cidr=cidr)
+        self.logger.emit(
+            level="INFO",
+            component="dut",
+            event="network_recovery_applied",
+            message=f"temporarily added {cidr} to {interface}",
+            fields={"ping_host": ping_host, "interface": interface, "static_cidr": cidr},
+        )
+
+        if self._serial_ping(session, ping_host):
+            return cleanup
+
+        self._cleanup_transfer_network_recovery(session, cleanup)
+        raise DutWorkflowError(
+            f"DUT still cannot reach {ping_host} after temporarily adding "
+            f"{cidr} to {interface}"
+        )
+
+    def _cleanup_transfer_network_recovery(
+        self,
+        session: SerialSession,
+        cleanup: _NetworkRecoveryCleanup | None,
+    ) -> None:
+        if cleanup is None or not self.config.upgrade.network_recovery.restore_after_transfer:
+            return
+        quoted_interface = shlex.quote(cleanup.interface)
+        quoted_cidr = shlex.quote(cleanup.static_cidr)
+        try:
+            session.run_command(
+                f"ip addr del {quoted_cidr} dev {quoted_interface} 2>/dev/null || true",
+                timeout_sec=self.config.dut.command_timeout_sec,
+                cancel_token=self.cancel_token,
+            )
+        except Exception as exc:
+            self.logger.emit(
+                level="WARN",
+                component="dut",
+                event="network_recovery_cleanup_failed",
+                message=f"failed to remove temporary {cleanup.static_cidr}: {exc}",
+                fields={
+                    "interface": cleanup.interface,
+                    "static_cidr": cleanup.static_cidr,
+                },
+            )
+            return
+        self.logger.emit(
+            level="INFO",
+            component="dut",
+            event="network_recovery_restored",
+            message=f"removed temporary {cleanup.static_cidr} from {cleanup.interface}",
+            fields={"interface": cleanup.interface, "static_cidr": cleanup.static_cidr},
+        )
+
+    def _serial_ping(self, session: SerialSession, host: str) -> bool:
+        quoted_host = shlex.quote(host)
+        result = session.run_command(
+            f"ping -c 1 -W 2 {quoted_host} >/dev/null 2>&1; echo OWRT_PING_RC=$?",
+            timeout_sec=max(self.config.dut.command_timeout_sec, 5),
+            cancel_token=self.cancel_token,
+        )
+        match = re.search(r"OWRT_PING_RC=(\d+)", result.output)
+        return match is not None and match.group(1) == "0"
+
+    def _network_proto_for_interface(self, session: SerialSession, interface: str) -> str | None:
+        quoted_interface = shlex.quote(interface)
+        command = (
+            f"iface={quoted_interface}; proto=''; "
+            "for s in $(uci -q show network | "
+            "sed -n 's/^network\\.\\([^.=]*\\)=interface$/\\1/p'); do "
+            "dev=$(uci -q get network.$s.device 2>/dev/null || true); "
+            '[ "$s" = "$iface" ] || [ "$dev" = "$iface" ] || continue; '
+            "proto=$(uci -q get network.$s.proto 2>/dev/null || true); break; "
+            "done; echo OWRT_PROTO=${proto:-unknown}"
+        )
+        result = session.run_command(
+            command,
+            timeout_sec=self.config.dut.command_timeout_sec,
+            cancel_token=self.cancel_token,
+        )
+        match = re.search(r"OWRT_PROTO=([^\s\r\n]+)", result.output)
+        if match is None:
+            return None
+        proto = match.group(1).strip()
+        return None if proto == "unknown" else proto
+
     def _http_download_and_verify(
         self,
         session: SerialSession,
@@ -471,11 +971,12 @@ class DutWorkflow:
         self._check_dut_free_space(session, artifact)
         remote = shlex.quote(self.config.upgrade.remote_path)
         quoted_url = shlex.quote(url)
-        session.run_command(
+        result = session.run_command(
             f"wget -O {remote} {quoted_url}",
             timeout_sec=self.config.upgrade.transfer_timeout_sec,
             cancel_token=self.cancel_token,
         )
+        self._raise_on_serial_command_error(result.output, "HTTP firmware download")
         self._verify_remote_firmware(session, artifact)
 
     def _tftp_download_and_verify(
@@ -488,12 +989,168 @@ class DutWorkflow:
         remote = shlex.quote(self.config.upgrade.remote_path)
         filename = shlex.quote(artifact.filename)
         quoted_host = shlex.quote(host)
-        session.run_command(
+        result = session.run_command(
             f"tftp -g -r {filename} -l {remote} {quoted_host}",
             timeout_sec=self.config.upgrade.transfer_timeout_sec,
             cancel_token=self.cancel_token,
         )
+        self._raise_on_serial_command_error(result.output, "TFTP firmware download")
         self._verify_remote_firmware(session, artifact)
+
+    def _scp_transfer_and_verify(
+        self,
+        session: SerialSession,
+        artifact: ExportedArtifact,
+    ) -> None:
+        self._check_dut_free_space(session, artifact)
+        command = self._render_scp_command(artifact)
+        self._run_host_transfer_command(
+            command,
+            artifact=artifact,
+            description="scp transfer command",
+        )
+        self._verify_remote_firmware(session, artifact)
+
+    def _custom_transfer_and_verify(
+        self,
+        session: SerialSession,
+        artifact: ExportedArtifact,
+    ) -> None:
+        self._check_dut_free_space(session, artifact)
+        command = self._render_custom_transfer_command(artifact)
+        self._run_host_transfer_command(
+            command,
+            artifact=artifact,
+            description="custom transfer command",
+        )
+        self._verify_remote_firmware(session, artifact)
+
+    def _render_scp_command(self, artifact: ExportedArtifact) -> list[str]:
+        command = [self.config.upgrade.scp_binary]
+        if self.config.upgrade.scp_port != 22:
+            command.extend(["-P", str(self.config.upgrade.scp_port)])
+        if self.config.upgrade.scp_identity_file is not None:
+            command.extend(["-i", str(self.config.upgrade.scp_identity_file)])
+        command.extend(self.config.upgrade.scp_extra_args)
+        command.extend([str(artifact.host_path), self._scp_target()])
+        return command
+
+    def _scp_target(self) -> str:
+        host = self.config.upgrade.scp_host or self.config.dut.network.address
+        if not host:
+            raise DutWorkflowError(
+                "upgrade.scp_host or dut.network.address is required for transfer=scp"
+            )
+        return f"{self.config.upgrade.scp_user}@{host}:{self.config.upgrade.remote_path}"
+
+    def _run_host_transfer_command(
+        self,
+        command: list[str],
+        *,
+        artifact: ExportedArtifact,
+        description: str,
+    ) -> None:
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                command,
+                env=self._script_env(artifact),
+                capture_output=True,
+                text=True,
+                timeout=self.config.upgrade.transfer_timeout_sec,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = self._subprocess_timeout_output(exc)
+            raise DutWorkflowError(
+                f"{description} timed out after "
+                f"{self.config.upgrade.transfer_timeout_sec}s"
+                + (f": {output}" if output else "")
+            ) from exc
+        except OSError as exc:
+            raise DutWorkflowError(f"{description} failed to start: {exc}") from exc
+
+        duration = time.monotonic() - started
+        output = (completed.stdout or "") + (completed.stderr or "")
+        self.logger.emit(
+            level="INFO" if completed.returncode == 0 else "ERROR",
+            component="transfer",
+            event="host_transfer_completed",
+            message=(
+                f"{description} completed"
+                if completed.returncode == 0
+                else f"{description} failed with exit {completed.returncode}"
+            ),
+            fields={
+                "exit_code": completed.returncode,
+                "duration_sec": duration,
+                "command": command[:1],
+            },
+        )
+        if completed.returncode != 0:
+            raise DutWorkflowError(
+                f"{description} exited {completed.returncode}: "
+                f"{self._summarize_subprocess_output(output)}"
+            )
+
+    def _render_custom_transfer_command(self, artifact: ExportedArtifact) -> list[str]:
+        context = {
+            "artifact": str(artifact.host_path),
+            "artifact_path": str(artifact.host_path),
+            "filename": artifact.filename,
+            "sha256": artifact.sha256,
+            "size_bytes": str(artifact.size_bytes),
+            "remote_path": self.config.upgrade.remote_path,
+            "dut_name": self.config.dut.name,
+            "dut_serial": self.config.dut.serial or "",
+            "dut_address": self.config.dut.network.address or "",
+            "run_dir": str(self.run_dir),
+            "job_id": self.job_id,
+        }
+        rendered: list[str] = []
+        try:
+            for part in self.config.upgrade.custom_transfer_command:
+                rendered.append(part.format_map(context))
+        except KeyError as exc:
+            raise DutWorkflowError(
+                f"unknown custom transfer placeholder {{{exc.args[0]}}}"
+            ) from exc
+        return rendered
+
+    @staticmethod
+    def _subprocess_timeout_output(exc: subprocess.TimeoutExpired) -> str:
+        output = ""
+        if exc.stdout is not None:
+            output += exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode(
+                "utf-8", errors="replace"
+            )
+        if exc.stderr is not None:
+            output += exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode(
+                "utf-8", errors="replace"
+            )
+        return DutWorkflow._summarize_subprocess_output(output)
+
+    @staticmethod
+    def _summarize_subprocess_output(output: str) -> str:
+        compact = output.strip()
+        if not compact:
+            return "<no output>"
+        return compact[-1000:]
+
+    def _raise_on_serial_command_error(self, output: str, description: str) -> None:
+        for pattern in _SERIAL_COMMAND_ERROR_PATTERNS:
+            match = pattern.search(output)
+            if match is None:
+                continue
+            evidence = match.group(0).strip()
+            self.logger.emit(
+                level="ERROR",
+                component="dut",
+                event="serial_command_failed",
+                message=f"{description} failed: {evidence}",
+                fields={"description": description, "evidence": evidence},
+            )
+            raise DutWorkflowError(f"{description} failed: {evidence}")
 
     def _verify_remote_firmware(
         self,
@@ -501,17 +1158,21 @@ class DutWorkflow:
         artifact: ExportedArtifact,
     ) -> None:
         remote = shlex.quote(self.config.upgrade.remote_path)
-        session.run_command(
+        size_result = session.run_command(
             f"test $(wc -c < {remote}) -eq {artifact.size_bytes}",
             timeout_sec=self.config.dut.command_timeout_sec,
             cancel_token=self.cancel_token,
         )
+        self._raise_on_serial_command_error(size_result.output, "remote firmware size verification")
         if self.config.upgrade.verify_sha256:
             expected = shlex.quote(artifact.sha256)
-            session.run_command(
+            sha_result = session.run_command(
                 f"sha256sum {remote} | grep -i ^{expected}",
                 timeout_sec=self.config.dut.command_timeout_sec,
                 cancel_token=self.cancel_token,
+            )
+            self._raise_on_serial_command_error(
+                sha_result.output, "remote firmware SHA256 verification"
             )
 
     def _publish_to_tftp_root(self, artifact: ExportedArtifact) -> Path:
@@ -530,6 +1191,8 @@ class DutWorkflow:
             )
         destination = tftp_root / artifact.filename
         try:
+            if destination.exists() and not os.access(destination, os.W_OK):
+                destination.unlink()
             shutil.copy2(artifact.host_path, destination)
         except OSError as exc:
             raise DutWorkflowError(
@@ -599,6 +1262,24 @@ class DutWorkflow:
         base_env = self._script_env(artifact)
         for script in scripts:
             self._check_cancel()
+            if not script.enabled:
+                result = ScriptTestResult(
+                    name=script.name,
+                    path=script.path,
+                    passed=False,
+                    exit_code=0,
+                    output="skipped by config",
+                    duration_sec=0.0,
+                    skipped=True,
+                )
+                results.append(result)
+                self._emit_host_test_event(
+                    event="script_test_completed",
+                    kind="script",
+                    name=script.name,
+                    result=result,
+                )
+                continue
             env = {**base_env, **script.env}
             cmd = [script.path, *script.args]
             started = time.monotonic()
@@ -655,23 +1336,305 @@ class DutWorkflow:
                         duration_sec=time.monotonic() - started,
                     )
                 )
-            self.logger.emit(
-                level="INFO" if results[-1].passed else "WARN",
-                component="tests",
+            self._emit_host_test_event(
                 event="script_test_completed",
-                message=(
-                    f"script `{script.name}` "
-                    f"{'passed' if results[-1].passed else 'failed'} "
-                    f"in {results[-1].duration_sec:.2f}s"
-                ),
+                kind="script",
+                name=script.name,
+                result=results[-1],
+            )
+        return results
+
+    def run_pytest_tests(
+        self,
+        artifact: ExportedArtifact | None = None,
+    ) -> list[PytestTestResult]:
+        """Run each `tests.pytest[]` entry as `python -m pytest`.
+
+        This is the structured counterpart to custom scripts for host-side test
+        suites. It uses argument arrays and exposes the same `OWRT_*` context.
+        """
+        results: list[PytestTestResult] = []
+        entries = self.config.tests.pytest
+        if not entries:
+            return results
+
+        base_env = self._script_env(artifact)
+        for entry in entries:
+            self._check_cancel()
+            if not entry.enabled:
+                result = PytestTestResult(
+                    name=entry.name,
+                    path=entry.path,
+                    passed=False,
+                    exit_code=0,
+                    output="skipped by config",
+                    duration_sec=0.0,
+                    skipped=True,
+                )
+                results.append(result)
+                self._emit_host_test_event(
+                    event="pytest_test_completed",
+                    kind="pytest",
+                    name=entry.name,
+                    result=result,
+                )
+                continue
+            env = {**base_env, **entry.env}
+            python = entry.python or sys.executable
+            cmd = [python, "-m", "pytest", entry.path, *entry.args]
+            started = time.monotonic()
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=entry.timeout_sec,
+                    check=False,
+                )
+                duration = time.monotonic() - started
+                results.append(
+                    PytestTestResult(
+                        name=entry.name,
+                        path=entry.path,
+                        passed=completed.returncode == 0,
+                        exit_code=completed.returncode,
+                        output=(completed.stdout or "") + (completed.stderr or ""),
+                        duration_sec=duration,
+                    )
+                )
+            except subprocess.TimeoutExpired as exc:
+                duration = time.monotonic() - started
+                results.append(
+                    PytestTestResult(
+                        name=entry.name,
+                        path=entry.path,
+                        passed=False,
+                        exit_code=-1,
+                        output=(
+                            self._subprocess_timeout_output(exc)
+                            or f"timed out after {entry.timeout_sec}s"
+                        ),
+                        duration_sec=duration,
+                        timed_out=True,
+                    )
+                )
+            except OSError as exc:
+                results.append(
+                    PytestTestResult(
+                        name=entry.name,
+                        path=entry.path,
+                        passed=False,
+                        exit_code=-1,
+                        output=f"failed to launch pytest: {exc}",
+                        duration_sec=time.monotonic() - started,
+                    )
+                )
+            self._emit_host_test_event(
+                event="pytest_test_completed",
+                kind="pytest",
+                name=entry.name,
+                result=results[-1],
+            )
+        return results
+
+    def run_ssh_tests(
+        self,
+        artifact: ExportedArtifact | None = None,
+    ) -> list[SshTestResult]:
+        """Run each `tests.ssh[]` entry through the host `ssh` binary."""
+        results: list[SshTestResult] = []
+        entries = self.config.tests.ssh
+        if not entries:
+            return results
+
+        base_env = self._script_env(artifact)
+        for entry in entries:
+            self._check_cancel()
+            host = entry.host or self.config.dut.network.address or ""
+            started = time.monotonic()
+            if not entry.enabled:
+                result = SshTestResult(
+                    name=entry.name,
+                    command=entry.command,
+                    host=host,
+                    passed=False,
+                    exit_code=0,
+                    output="skipped by config",
+                    duration_sec=0.0,
+                    assertion=entry.expect,
+                    skipped=True,
+                )
+                results.append(result)
+                self._emit_host_test_event(
+                    event="ssh_test_completed",
+                    kind="ssh",
+                    name=entry.name,
+                    result=result,
+                    fields={
+                        "host": result.host,
+                        "assertion_failed": result.assertion_failed,
+                    },
+                )
+                continue
+            if not host:
+                result = SshTestResult(
+                    name=entry.name,
+                    command=entry.command,
+                    host="",
+                    passed=False,
+                    exit_code=-1,
+                    output="tests.ssh[].host or dut.network.address is required",
+                    duration_sec=time.monotonic() - started,
+                    assertion=entry.expect,
+                )
+                results.append(result)
+                self._emit_host_test_event(
+                    event="ssh_test_completed",
+                    kind="ssh",
+                    name=entry.name,
+                    result=result,
+                    fields={
+                        "host": result.host,
+                        "assertion_failed": result.assertion_failed,
+                    },
+                )
+                continue
+
+            cmd = self._render_ssh_command(entry, host)
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=entry.timeout_sec,
+                    check=False,
+                )
+                duration = time.monotonic() - started
+                output = (completed.stdout or "") + (completed.stderr or "")
+                assertion_failed = (
+                    entry.expect is not None and re.search(entry.expect, output) is None
+                )
+                results.append(
+                    SshTestResult(
+                        name=entry.name,
+                        command=entry.command,
+                        host=host,
+                        passed=completed.returncode == 0 and not assertion_failed,
+                        exit_code=completed.returncode,
+                        output=output,
+                        duration_sec=duration,
+                        assertion=entry.expect,
+                        assertion_failed=assertion_failed,
+                    )
+                )
+            except subprocess.TimeoutExpired as exc:
+                duration = time.monotonic() - started
+                results.append(
+                    SshTestResult(
+                        name=entry.name,
+                        command=entry.command,
+                        host=host,
+                        passed=False,
+                        exit_code=-1,
+                        output=(
+                            self._subprocess_timeout_output(exc)
+                            or f"timed out after {entry.timeout_sec}s"
+                        ),
+                        duration_sec=duration,
+                        assertion=entry.expect,
+                        timed_out=True,
+                    )
+                )
+            except OSError as exc:
+                results.append(
+                    SshTestResult(
+                        name=entry.name,
+                        command=entry.command,
+                        host=host,
+                        passed=False,
+                        exit_code=-1,
+                        output=f"failed to launch ssh: {exc}",
+                        duration_sec=time.monotonic() - started,
+                        assertion=entry.expect,
+                    )
+                )
+
+            self._emit_host_test_event(
+                event="ssh_test_completed",
+                kind="ssh",
+                name=entry.name,
+                result=results[-1],
                 fields={
-                    "name": script.name,
-                    "exit_code": results[-1].exit_code,
-                    "passed": results[-1].passed,
-                    "timed_out": results[-1].timed_out,
+                    "host": results[-1].host,
+                    "assertion_failed": results[-1].assertion_failed,
                 },
             )
         return results
+
+    def _emit_host_test_event(
+        self,
+        *,
+        event: str,
+        kind: str,
+        name: str,
+        result: HostTestResult,
+        fields: dict[str, object] | None = None,
+    ) -> None:
+        status = "skipped" if result.skipped else ("passed" if result.passed else "failed")
+        message = f"{kind} `{name}` {status}"
+        if not result.skipped:
+            message += f" in {result.duration_sec:.2f}s"
+        payload: dict[str, object] = {
+            "name": name,
+            "exit_code": result.exit_code,
+            "passed": result.passed,
+            "timed_out": result.timed_out,
+            "skipped": result.skipped,
+        }
+        if fields:
+            payload.update(fields)
+        self.logger.emit(
+            level="INFO" if result.passed or result.skipped else "WARN",
+            component="tests",
+            event=event,
+            message=message,
+            fields=payload,
+        )
+
+    @staticmethod
+    def _record_test_metrics(
+        *,
+        metrics: dict[str, float],
+        test_started: float,
+        smoke_results: list[SmokeTestResult],
+        script_results: list[ScriptTestResult],
+        pytest_results: list[PytestTestResult],
+        ssh_results: list[SshTestResult],
+    ) -> None:
+        metrics["smoke_duration_sec"] = sum(
+            float(result.duration_sec) for result in smoke_results
+        )
+        metrics["script_duration_sec"] = DutWorkflow._sum_host_test_durations(script_results)
+        metrics["pytest_duration_sec"] = DutWorkflow._sum_host_test_durations(pytest_results)
+        metrics["ssh_duration_sec"] = DutWorkflow._sum_host_test_durations(ssh_results)
+        metrics["test_duration_sec"] = time.monotonic() - test_started
+
+    @staticmethod
+    def _render_ssh_command(entry: Any, host: str) -> list[str]:
+        cmd = [entry.ssh_binary]
+        if entry.port != 22:
+            cmd.extend(["-p", str(entry.port)])
+        if entry.identity_file is not None:
+            cmd.extend(["-i", str(entry.identity_file)])
+        cmd.extend(entry.extra_args)
+        cmd.extend([f"{entry.user}@{host}", entry.command])
+        return cmd
+
+    @staticmethod
+    def _sum_host_test_durations(results: list[HostTestResult]) -> float:
+        return sum(float(result.duration_sec) for result in results)
 
     def _script_env(self, artifact: ExportedArtifact | None) -> dict[str, str]:
         env = dict(os.environ)
@@ -841,47 +1804,9 @@ class DutWorkflow:
         watches for `login:` and `password:` banners and replies in turn.
         Password writes are redacted in the serial transcript.
         """
-        session.connect()
-        session.send_newline()
-        timeout = self.config.dut.connect_timeout_sec
-        login = self.config.dut.login
-        prompt_re = re.compile(self.config.dut.prompt)
-
-        if login.password is None:
-            session.read_until(
-                prompt_re,
-                timeout_sec=timeout,
-                cancel_token=self.cancel_token,
-            )
-            return
-
-        sentinels = {
-            "shell": prompt_re,
-            "login": re.compile(r"[Ll]ogin:\s*$"),
-            "password": re.compile(r"[Pp]assword:\s*$"),
-        }
-        name, _ = session.read_until_one_of(
-            sentinels,
-            timeout_sec=timeout,
-            cancel_token=self.cancel_token,
-        )
-        if name == "shell":
-            return
-        if name == "login":
-            session.write_command(login.username)
-            name, _ = session.read_until_one_of(
-                {"shell": sentinels["shell"], "password": sentinels["password"]},
-                timeout_sec=timeout,
-                cancel_token=self.cancel_token,
-            )
-            if name == "shell":
-                return
-        # `name` is now "password" — either we hit it directly, or we sent a
-        # username and the device asked for a password.
-        session.write_command(login.password, redact_in_transcript=True)
-        session.read_until(
-            prompt_re,
-            timeout_sec=timeout,
+        _connect_session_with_optional_login(
+            self.config,
+            session,
             cancel_token=self.cancel_token,
         )
 
@@ -928,34 +1853,13 @@ class DutWorkflow:
         return remote_path[:idx] if idx > 0 else "/tmp"
 
     def _create_serial_session(self) -> SerialSession:
-        serial_path = self.config.dut.serial or self._discover_one_serial_port()
-        newline = "\r\n" if self.config.dut.newline == "crlf" else "\n"
-        return SerialSession(
-            port=serial_path,
-            baud=self.config.dut.baud,
-            prompt=self.config.dut.prompt,
-            transcript_path=self.run_dir / "serial.log",
-            newline=newline,
-            bytesize=self.config.dut.bytesize,
-            parity=self.config.dut.parity,
-            stopbits=self.config.dut.stopbits,
-        )
+        return _configured_serial_session(self.config, self.run_dir / "serial.log")
 
     def _discover_one_serial_port(self) -> str:
-        ports = discover_serial_ports(self.config.dut.discovery_patterns)
-        if not ports:
-            raise DutWorkflowError(
-                "no USB serial ports found; configure dut.serial or adjust dut.discovery_patterns"
-            )
-        if len(ports) > 1:
-            raise DutWorkflowError(
-                "multiple USB serial ports found; configure dut.serial explicitly: "
-                + ", ".join(ports)
-            )
-        return ports[0]
+        return _resolve_serial_path(None, self.config.dut.discovery_patterns)
 
     def _firmware_host(self) -> str:
-        if self.config.upgrade.transfer == "tftp":
+        if self.config.upgrade.transfer in {"tftp", "bootloader_tftp"}:
             configured = self.config.upgrade.tftp_host or self.config.upgrade.http_host
             host_field = "upgrade.tftp_host"
         else:

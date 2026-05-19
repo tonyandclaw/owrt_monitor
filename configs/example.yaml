@@ -26,7 +26,7 @@ artifact:
 
 dut:
   name: dut-01
-  serial: /dev/cu.usbserial-0001
+  serial: ${OWRT_DUT_SERIAL:-/dev/cu.usbserial-8340}
   baud: 115200
   prompt: "root@OpenWrt:.*# "
   newline: lf
@@ -85,6 +85,17 @@ profiles:
       transfer: tftp
       tftp_root: /private/tftpboot
       tftp_host: 192.168.1.66
+      # Some lab images boot with br-lan as DHCP client, while others boot
+      # with static IPv4. Before TFTP, ping the Mac TFTP host; if unreachable
+      # and br-lan is configured as DHCP, add this runtime-only static IP for
+      # the transfer, then remove it before sysupgrade. Static configs are
+      # left untouched.
+      network_recovery:
+        enabled: true
+        ping_host: 192.168.1.66
+        interface: br-lan
+        static_cidr: 192.168.1.1/24
+        restore_after_transfer: true
       # Confirm the expected firmware actually booted — these regexes must all
       # appear in the boot transcript before the shell prompt. Catches "wrong
       # partition booted" or "stale firmware" cases the prompt regex alone misses.

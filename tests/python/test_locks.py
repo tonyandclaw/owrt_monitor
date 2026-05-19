@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -124,6 +125,35 @@ def test_locks_snapshot_updated_on_release(tmp_path: Path) -> None:
     assert payload["dut_locks"] == []
 
 
+def test_locks_snapshot_preserves_go_owned_lock_fields(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    snapshot = tmp_path / "locks.json"
+    snapshot.write_text(
+        """
+{
+  "generated_at": "2026-05-14T00:00:00Z",
+  "dut_locks": [],
+  "builder_locks": [],
+  "serial_locks": [
+    {"name": "tty-usb0", "owner_job_id": "go-job", "created_at": "x", "heartbeat_at": "x"}
+  ],
+  "artifact_locks": [
+    {"name": "export-root", "owner_job_id": "go-job", "created_at": "x", "heartbeat_at": "x"}
+  ]
+}
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    store = JobStore(db)
+    store.acquire_dut_lock(dut_name="dut-r", owner_job_id="job1")
+    store.release_dut_lock(dut_name="dut-r", owner_job_id="job1")
+
+    payload = json.loads(snapshot.read_text(encoding="utf-8"))
+    assert payload["serial_locks"][0]["name"] == "tty-usb0"
+    assert payload["artifact_locks"][0]["name"] == "export-root"
+
+
 def test_locks_snapshot_atomic_under_concurrent_lookups(tmp_path: Path) -> None:
     """The temp-then-rename pattern means a reader never observes a torn
     file — either the old contents or the new, but not a partial write."""
@@ -166,3 +196,18 @@ def test_heartbeat_refreshes_lock(tmp_path: Path) -> None:
         )
         is False
     )
+
+
+def test_release_locks_for_job_removes_only_owned_locks(tmp_path: Path) -> None:
+    db = tmp_path / "state.sqlite3"
+    store = JobStore(db)
+    assert store.acquire_dut_lock(dut_name="dut-owned", owner_job_id="ghost") is True
+    assert store.acquire_builder_lock(builder_name="bld-owned", owner_job_id="ghost") is True
+    assert store.acquire_dut_lock(dut_name="dut-other", owner_job_id="other") is True
+
+    released = store.release_locks_for_job(owner_job_id="ghost")
+
+    assert released == {"dut_locks": 1, "builder_locks": 1}
+    assert store.acquire_dut_lock(dut_name="dut-owned", owner_job_id="new") is True
+    assert store.acquire_builder_lock(builder_name="bld-owned", owner_job_id="new") is True
+    assert store.acquire_dut_lock(dut_name="dut-other", owner_job_id="new") is False

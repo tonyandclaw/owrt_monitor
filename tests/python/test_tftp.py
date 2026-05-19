@@ -13,7 +13,7 @@ from owrt_monitor.dut_workflow import DutWorkflow, DutWorkflowError
 from owrt_monitor.events import EventLogger
 from owrt_monitor.state import JobState
 from owrt_monitor.storage import JobStore
-from owrt_monitor.workflow import BuildWorkflow
+from owrt_monitor.workflow import BuildWorkflow, WorkflowError
 
 
 class _FakeSerialTransport:
@@ -76,6 +76,51 @@ def test_publish_to_tftp_root_copies_artifact_with_metadata(tmp_path: Path) -> N
     assert destination.read_bytes() == firmware.read_bytes()
     # Per-job copy is preserved (audit requirement).
     assert firmware.exists()
+
+
+def test_publish_to_tftp_root_replaces_unwritable_existing_file(tmp_path: Path) -> None:
+    config_path = _write_tftp_config(tmp_path)
+    config = load_config(config_path)
+    store = JobStore(tmp_path / "state.sqlite3")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    store.create_job(
+        job_id="job_publish_replace",
+        config_path=config_path,
+        artifact_dir=run_dir,
+        state=JobState.PENDING.value,
+        config_snapshot=config.redacted_dump(),
+    )
+    logger = EventLogger(
+        store=store, job_id="job_publish_replace", path=run_dir / "events.jsonl"
+    )
+    workflow = DutWorkflow(
+        config=config,
+        run_dir=run_dir,
+        logger=logger,
+        store=store,
+        job_id="job_publish_replace",
+    )
+
+    firmware = run_dir / "firmware" / "openwrt-fake-sysupgrade.bin"
+    firmware.parent.mkdir(parents=True)
+    firmware.write_bytes(b"NEW_FIRMWARE_BYTES" * 100)
+    artifact = ExportedArtifact(
+        container_path="<host>",
+        host_path=firmware,
+        filename=firmware.name,
+        size_bytes=firmware.stat().st_size,
+        sha256=sha256_file(firmware),
+    )
+
+    destination = Path(config.upgrade.tftp_root) / firmware.name
+    destination.write_bytes(b"old")
+    destination.chmod(0o444)
+
+    published = workflow._publish_to_tftp_root(artifact)
+
+    assert published == destination
+    assert destination.read_bytes() == firmware.read_bytes()
 
 
 def test_publish_to_tftp_root_raises_when_root_missing(tmp_path: Path) -> None:
@@ -224,6 +269,97 @@ def test_full_flow_fails_fast_on_kernel_panic(tmp_path: Path) -> None:
     assert result == "failed"
 
 
+def test_tftp_transfer_error_fails_before_sysupgrade(tmp_path: Path) -> None:
+    config_path = _write_tftp_config(tmp_path)
+    config = load_config(config_path)
+    fake_docker = FakeDockerBuildClient(builder=config.builder)
+
+    prompt = b"root@OpenWrt:/# "
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"tftp: sendto: Network unreachable\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=fake_docker,
+        dut_workflow_kwargs={"serial_session": fake_session},
+    )
+
+    with pytest.raises(WorkflowError, match=r"TFTP firmware download failed.*Network unreachable"):
+        workflow.run(dry_run=False, allow_flash=True)
+
+    written = b"".join(transport.writes)
+    assert b"tftp -g -r" in written
+    assert b"sysupgrade -n" not in written
+
+
+def test_tftp_network_recovery_adds_and_removes_temporary_static_ip(tmp_path: Path) -> None:
+    config_path = _write_tftp_config(
+        tmp_path,
+        network_recovery={
+            "enabled": True,
+            "ping_host": "192.0.2.66",
+            "interface": "br-lan",
+            "static_cidr": "192.0.2.1/24",
+            "restore_after_transfer": True,
+        },
+    )
+    config = load_config(config_path)
+    fake_docker = FakeDockerBuildClient(builder=config.builder)
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"OWRT_PING_RC=1\n" + prompt,
+            b"OWRT_PROTO=dhcp\n" + prompt,
+            b"added\n" + prompt,
+            b"OWRT_PING_RC=0\n" + prompt,
+            b"tftp ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            b"removed\n" + prompt,
+            b"booted\n" + prompt,
+            status_json + prompt,
+            b"board ok\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=fake_docker,
+        dut_workflow_kwargs={"serial_session": fake_session},
+    )
+
+    report = workflow.run(dry_run=False, allow_flash=True)
+
+    assert report.success is True
+    written = b"".join(transport.writes)
+    assert b"ping -c 1 -W 2 192.0.2.66" in written
+    assert b"ip addr add 192.0.2.1/24 dev br-lan" in written
+    assert b"tftp -g -r" in written
+    assert b"ip addr del 192.0.2.1/24 dev br-lan" in written
+    assert written.index(b"ip addr add") < written.index(b"tftp -g -r")
+    assert written.index(b"tftp -g -r") < written.index(b"ip addr del")
+    assert written.index(b"ip addr del") < written.index(b"sysupgrade -n")
+
+
 def test_full_flow_renders_dut_status_section(tmp_path: Path) -> None:
     """The post-boot status capture should produce a `## DUT Status` block in
     the report with the parsed release summary, hostname, and kernel."""
@@ -282,6 +418,7 @@ def test_full_flow_records_boot_and_smoke_durations(tmp_path: Path) -> None:
     fake_docker = FakeDockerBuildClient(builder=config.builder)
 
     prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
     transport = _FakeSerialTransport(
         [
             prompt,
@@ -289,6 +426,7 @@ def test_full_flow_records_boot_and_smoke_durations(tmp_path: Path) -> None:
             b"size ok\n" + prompt,
             b"sha ok\n" + prompt,
             b"booted\n" + prompt,
+            status_json + prompt,
             b"board ok\n" + prompt,
         ]
     )
@@ -311,12 +449,14 @@ def test_full_flow_records_boot_and_smoke_durations(tmp_path: Path) -> None:
     assert report.metrics["build_duration_sec"] == pytest.approx(83.456, abs=0.01)
     # Boot duration is real wall-clock; can't pin a value, only a sane bound.
     assert 0 <= report.metrics["boot_duration_sec"] < 5
+    assert 0 <= report.metrics["test_duration_sec"] < 5
     assert 0 <= report.metrics["smoke_duration_sec"] < 5
 
     md = (report.run_dir / "report.md").read_text(encoding="utf-8")
     assert "## Metrics" in md
     assert "build_duration_sec" in md
     assert "boot_duration_sec" in md
+    assert "test_duration_sec" in md
 
 
 def test_planned_actions_for_tftp_profile_dry_run(tmp_path: Path) -> None:
@@ -335,6 +475,7 @@ def _write_tftp_config(
     tmp_path: Path,
     tftp_root: str | None = None,
     create_tftp_root: bool = True,
+    network_recovery: dict | None = None,
 ) -> Path:
     if tftp_root is None:
         tftp_root = str(tmp_path / "tftpboot")
@@ -370,6 +511,8 @@ def _write_tftp_config(
         },
         "tests": {"smoke": ["ubus call system board"], "command_timeout_sec": 1},
     }
+    if network_recovery is not None:
+        raw["upgrade"]["network_recovery"] = network_recovery
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return path

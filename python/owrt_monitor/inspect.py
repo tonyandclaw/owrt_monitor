@@ -30,6 +30,9 @@ class JobInspection:
     metrics: dict[str, Any] | None = None
     dut_status: dict[str, Any] | None = None
     test_results: list[dict[str, Any]] | None = None
+    script_results: list[dict[str, Any]] | None = None
+    pytest_results: list[dict[str, Any]] | None = None
+    ssh_results: list[dict[str, Any]] | None = None
     warnings: list[str] | None = None
     actions: list[str] | None = None
 
@@ -61,6 +64,9 @@ def inspect_job(store: JobStore, job_id: str) -> JobInspection | None:
         metrics=report.get("metrics") if report else None,
         dut_status=report.get("dut_status") if report else None,
         test_results=report.get("test_results") if report else None,
+        script_results=report.get("script_results") if report else None,
+        pytest_results=report.get("pytest_results") if report else None,
+        ssh_results=report.get("ssh_results") if report else None,
         warnings=report.get("warnings") if report else None,
         actions=report.get("actions") if report else None,
     )
@@ -115,7 +121,16 @@ def diff_pairs(left: JobInspection, right: JobInspection) -> list[tuple[str, str
     # Metrics
     lmet = left.metrics or {}
     rmet = right.metrics or {}
-    for key in ("build_duration_sec", "boot_duration_sec", "smoke_duration_sec"):
+    for key in (
+        "build_duration_sec",
+        "boot_duration_sec",
+        "flash_duration_sec",
+        "test_duration_sec",
+        "smoke_duration_sec",
+        "script_duration_sec",
+        "pytest_duration_sec",
+        "ssh_duration_sec",
+    ):
         add(f"metrics.{key}", lmet.get(key), rmet.get(key))
 
     # DUT status
@@ -130,12 +145,19 @@ def diff_pairs(left: JobInspection, right: JobInspection) -> list[tuple[str, str
     add("dut.release.version", lrel.get("version"), rrel.get("version"))
     add("dut.release.revision", lrel.get("revision"), rrel.get("revision"))
 
-    # Smoke summary
+    # Test result summaries
+    add("smoke.results", _result_summary(left.test_results), _result_summary(right.test_results))
     add(
-        "smoke.passed",
-        _smoke_summary(left.test_results),
-        _smoke_summary(right.test_results),
+        "scripts.results",
+        _result_summary(left.script_results),
+        _result_summary(right.script_results),
     )
+    add(
+        "pytest.results",
+        _result_summary(left.pytest_results),
+        _result_summary(right.pytest_results),
+    )
+    add("ssh.results", _result_summary(left.ssh_results), _result_summary(right.ssh_results))
     return pairs
 
 
@@ -153,9 +175,11 @@ def _safe_len(value: object) -> int | None:
     return None
 
 
-def _smoke_summary(results: list[dict[str, Any]] | None) -> str:
+def _result_summary(results: list[dict[str, Any]] | None) -> str:
     if not results:
         return "—"
     total = len(results)
     passed = sum(1 for r in results if r.get("passed"))
-    return f"{passed}/{total}"
+    skipped = sum(1 for r in results if r.get("skipped"))
+    suffix = f", {skipped} skipped" if skipped else ""
+    return f"{passed}/{total}{suffix}"

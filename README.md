@@ -30,9 +30,9 @@
 - 在 Docker builder container 內執行 OpenWrt build command。
 - 依 glob pattern 偵測 firmware artifact，支援 newest/largest/fail-if-multiple 選擇策略。
 - 用 `docker cp` 匯出 firmware，計算 SHA256，保存 artifact metadata。
-- 透過 USB serial 控制 DUT prompt、啟動臨時 HTTP firmware server、執行 `wget` transfer。
+- 透過 USB serial 控制 DUT prompt，支援 HTTP/SCP/TFTP/custom firmware transfer。
 - 在顯式 `--allow-flash` 下執行 configured upgrade command，等待 DUT prompt 回來。
-- 執行 configured smoke tests，保存 serial transcript 與 test results。
+- 執行 configured smoke/script/pytest/SSH tests，保存 serial transcript 與 test results。
 
 安裝開發環境：
 
@@ -44,12 +44,29 @@ python3 -m pip install -e ".[dev,serial]"
 
 ```sh
 owrt-monitor validate --config configs/example.yaml
+owrt-monitor lab-check --config configs/example.yaml --profile ap
 owrt-monitor dry-run --config configs/example.yaml
 owrt-monitor build --config configs/example.yaml
 owrt-monitor run --config configs/example.yaml --allow-flash
 owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
 owrt-monitor test --config configs/example.yaml
 owrt-monitor status --config configs/example.yaml
+owrt-monitor analyze <job_id> --config configs/example.yaml
+```
+
+Go runner/daemon path:
+
+```sh
+go run ./cmd/owrtd --artifacts-dir artifacts
+go run ./cmd/owrtctl -- build --config configs/example.yaml --profile ap
+go run ./cmd/owrtctl -- run --config configs/example.yaml --profile ap --allow-flash
+go run ./cmd/owrtctl -- flash --config configs/example.yaml --profile ap \
+    --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+open http://127.0.0.1:8765/ui/
+go run ./cmd/owrtctl -- jobs --limit 10
+go run ./cmd/owrtctl -- wait <job_id>
+go run ./cmd/owrtctl -- logs <job_id> --tail 80 --follow
+go run ./cmd/owrtctl -- file <job_id> report.md --output report.md
 ```
 
 `run --allow-flash` 和 `flash --allow-flash` 會執行破壞性的 DUT upgrade command；先用
