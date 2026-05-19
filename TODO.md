@@ -4,17 +4,17 @@
 
 ## Status snapshot (as of 0.1.0)
 
-**Active scope: 224/252 = 88.9%.** Phases 0, 1, 2, 3, 4, 12 are at 100%.
+**Active scope: 231/254 = 90.9%.** Phases 0, 1, 2, 3, 4, 12 are at 100%.
 
 Each remaining open box falls into one of these buckets:
 
 - **DEFERRED (no current driver)**: Speculative additions whose use case hasn't materialised in the lab yet. Schema placeholders may exist; full implementation lands when the first real need shows up.
-  Examples: SCP / custom-command transfer, SSH-based smoke tests, host-side pytest runner.
+  Examples: future non-standard lab integrations beyond the current transfer/test runners.
 
-- **BLOCKED ON Phase 7 (Go runner write-side)**: Items that only make sense once Go takes over execution from Python. Today owrtd is a read-only companion (8/23 of Phase 7 done); the remaining 15 items need a daemon-takeover decision before they can land.
-  Examples: submit-job API, process supervision, log rotation, in-Go resource locks, daemon-restart recovery.
+- **BLOCKED ON Phase 7 (Go runner write-side)**: resolved. owrtd now has the read API, submit bridge, runner supervision, stdout/stderr capture, Go-side cancel state, runner output tail/follow, stale runner recovery, runner output backpressure/rotation, Go-side resource locks, and optional Python CLI/client handoff through `--daemon-url`.
+  Examples now move to **NEEDS HARDWARE**: run the Go-managed path against a real DUT before UI/LLM work.
 
-- **NEEDS HARDWARE**: End-to-end test against a real DUT. CI fully covers the workflow with fakes (190 Python + 26 Go tests); real-hardware sign-off is a release gate, not a code-completion item.
+- **NEEDS HARDWARE**: End-to-end test against a real DUT. CI fully covers the workflow with fakes (228 Python + 52 Go tests); real-hardware sign-off is the next release gate before destructive real flash sign-off.
 
 - **DEFERRED-BY-DESIGN**: Phase 8 (iTerm2/tmux observer) and Phase 9 (LLM assistance) are explicitly secondary per `ARCHITECTURE.md`. The deterministic workflow is the source of truth; observer/LLM layers are future enhancements.
 
@@ -74,7 +74,7 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 ## Phase 2 - Python Orchestrator MVP
 
-- [x] 建立 Python CLI（11 commands）：
+- [x] 建立 Python CLI（14 commands）：
   - [x] `owrt-monitor build`。
   - [x] `owrt-monitor flash`。
   - [x] `owrt-monitor test`。
@@ -166,13 +166,13 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 ## Phase 5 - Firmware Transfer and Upgrade
 
-- [x] 支援 firmware transfer methods（HTTP / TFTP / U-Boot bootloader-TFTP；SCP 與 custom command 留給之後）：
+- [x] 支援 firmware transfer methods（HTTP / SCP / TFTP / U-Boot bootloader-TFTP / custom command）：
   - [x] host HTTP server + DUT `wget`/`curl`。
-  - [ ] SCP when DUT network is ready（schema 已含 `transfer: scp` literal placeholder；實作留待第一個需要的 board 上線時做。HTTP/TFTP/bootloader-TFTP 已涵蓋目前所有實機 boards）。
+  - [x] SCP when DUT network is ready（host-side `scp` command，支援 `scp_host` / `scp_user` / port / identity / extra args；fake-DUT E2E 用 fake `scp` binary 覆蓋）。
   - [x] TFTP for bootloader/recovery flow（兩種 TFTP）：
     - [x] OpenWrt-shell TFTP（`upgrade.transfer: tftp`：DUT busybox `tftp -g -r ...`）。
     - [x] U-Boot bootloader TFTP（`upgrade.transfer: bootloader_tftp`：shell `reboot` → 等 autoboot banner → 送 interrupt key → `setenv serverip/ipaddr; tftpboot <addr> <name>; bootm`，volatile boot 不寫 flash；`upgrade.bootloader.*` 全部可調；configs/example.yaml 已加 `ap-recovery` profile）。
-  - [ ] custom command（schema 已含 `transfer: custom` literal placeholder；實作留待第一個非標準 transfer 機制需要時做。設計上應為 user 提供 shell template，由 host 端 subprocess 執行）。
+  - [x] custom command（`upgrade.custom_transfer_command` 為 host-side argument array，支援 `{artifact}` / `{remote_path}` / DUT context placeholders；執行後仍走 serial size + SHA256 驗證，fake-DUT E2E 覆蓋）。
 - [x] host 啟動臨時 HTTP server（`TemporaryFirmwareServer`：bind interface + port 0=auto；checksum endpoint 與 transfer log 為 nice-to-have，留作 future）：
   - [x] bind interface。
   - [x] random safe port。
@@ -191,8 +191,8 @@ When opening a new slice, check this bucket first — most "open" items are deli
   - [x] minimum battery/power note if applicable（informational：`docs/safe-upgrade.md` 的 pre-flash checklist 提醒人 hardware 上電穩定後才 flash；機制上沒有自動 battery 偵測，因為 lab 板均為直流供電，不適用）。
   - [x] enough `/tmp` space（`upgrade.min_dut_free_kb`，預設 0=disabled；BusyBox `df -k` 解析 + 跟 firmware 大小取最大）。
   - [x] no active conflicting job（builder lock：`builder.lock_timeout_sec` 預設 3600；BuildWorkflow.run 起 acquire、finally release，stale heartbeat 自動回收，dry-run 跳過）。
-- [ ] upgrade 後等待 reboot（剩 serial disconnect/reconnect tolerance）：
-  - [ ] serial disconnect/reconnect tolerance（pyserial 在 USB 拔插時會 raise OSError；尚未 wrap 為自動 reconnect — 對 flash 流程影響低，因為 sysupgrade 通常不會物理拔線）。
+- [x] upgrade 後等待 reboot：
+  - [x] serial disconnect/reconnect tolerance（post-upgrade prompt wait 會在 serial I/O error 後重新開啟 serial port，送 newline 重新喚出 prompt，並保留 transcript marker；fake-DUT E2E 覆蓋 USB serial drop/reconnect path）。
   - [x] boot timeout。
   - [x] prompt detection。
   - [x] fail-fast on kernel panic（`upgrade.boot_failure_patterns`，預設含 "Kernel panic - not syncing"、"Oops:"、"Unable to handle kernel paging request" 等；偵測到立即拋 BootFailureError，evidence 帶被觸發那一行）。
@@ -200,11 +200,12 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 ## Phase 6 - Post-Upgrade Testing
 
-- [x] 支援 test runner interface（serial shell 是主要路徑，含 regex assertion；SSH/pytest/custom 留給之後）：
+- [x] 支援 test runner interface（serial shell 是主要路徑，含 regex assertion；host-side SSH/pytest/custom runners 已支援）：
   - [x] serial shell tests。
-  - [ ] SSH tests（schema 已含 SmokeTest.expect regex；SSH-via-paramiko 留待第一個 SSH-only DUT 上線時做）。
-  - [ ] pytest tests（host-side runner 留待之後；目前可用 custom scripts 跑 pytest invocation 達到同樣效果）。
+  - [x] SSH tests（`tests.ssh[]` host-side runner，使用 system `ssh` arg array，支援 host/user/port/identity/extra args/expect/timeout；fake-DUT E2E 用 fake ssh binary 覆蓋）。
+  - [x] pytest tests（`tests.pytest[]` host-side runner，使用 `python -m pytest`，支援 args/env/timeout/python override；結果有 `## Pytest Tests` report section，fake-DUT E2E 覆蓋）。
   - [x] custom scripts（`tests.scripts: list[ScriptTest]`：每個 script 是 host-side subprocess，DUT 資訊透過 `OWRT_DUT_*` env vars 暴露；exit-0=pass、非零或 timeout=fail；output capture 進 `report.md` 的 `## Custom Scripts` 段）。
+- [x] `owrt-monitor test` standalone path 跑完整 test stack（serial smoke → host scripts → host pytest → host SSH），dry-run 會列出全部 planned actions；任何 runner fail 都讓 job result = failed。
 - [x] 基本 smoke tests（smoke 條目支援 `command + expect` regex；mismatch 標記 `assertion_failed=True`）：
   - [x] OpenWrt version（post-boot status capture，從 `ubus call system board` JSON 解出 release.distribution + release.version）。
   - [x] kernel version（同上，`kernel` 欄位）。
@@ -214,7 +215,7 @@ When opening a new slice, check this bucket first — most "open" items are deli
   - [x] expected services（`command: /etc/init.d/<svc> status` + `expect: running`）。
 - [x] 支援 board-specific tests（profile overlay 可蓋 `tests.smoke`、`tests.status_command`、整個 `dut.*` block；configs/example.yaml 的 `ap` / `controller` / `switch` 各自有不同的 smoke 列表能力）。
 - [x] 支援 test result report：
-  - [x] passed/failed/skipped（report.md 加 `Result: **PASS|FAIL** (N/M passed, K failed, T s total)` 聚合行；skipped 仍未支援，需配合 fail-fast 機制）。
+  - [x] passed/failed/skipped（每個 smoke/script/pytest/SSH entry 支援 `enabled: false`，report.md 聚合 passed/failed/skipped；skipped 不會讓 job failed）。
   - [x] duration（每行 smoke test 後加 `(0.12 s)`，並有 total 行）。
   - [x] logs。
   - [x] firmware metadata。
@@ -222,36 +223,38 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 ## Phase 7 - Go Runner / Daemon
 
-> **Status: 8/23 done (read API complete).** owrtd is a working read-only
-> companion daemon; the remaining 15 boxes are the **write-side** —
-> daemonised job execution, in-Go process supervision, in-Go locks.
-> Each is multi-day work and depends on a one-time decision: does Go
-> take over from Python, or stay read-only? Until that decision is made,
-> these items are BLOCKED, not "just not yet done".
+> **Status: COMPLETE pending real-hardware sign-off.** owrtd now has
+> the full read API plus `POST /v1/jobs`, which launches the existing Python
+> workflow as a child process with a Go-generated job id and writes
+> `<run_dir>/runner.json` for Go-side runner state and heartbeat, plus
+> `<run_dir>/runner.output.jsonl` for structured stdout/stderr. Python CLI
+> commands can still run directly by default, or submit through owrtd with
+> `--daemon-url`.
 
-- [x] 建立 `owrtd` Go daemon（read-only HTTP server，net/http stdlib only，無新 deps；`--addr` + `--artifacts-dir` flags；`http.Server{}` 含 read/write/idle timeouts）。
-- [ ] 提供本機 API（BLOCKED on Phase 7 write-side decision）：
-  - [ ] submit job（write side 留待後續，Python `BuildWorkflow.run` 是現行入口）。
-  - [x] cancel job（`POST /v1/jobs/{id}/cancel` 寫 `cancel.flag` marker 進 run_dir，跟 Python `cancel` CLI 同一機制；workflow 主動 poll 該 marker，cooperatively abort）。
-  - [x] stream logs（`GET /v1/jobs/{id}/events` 回 events.jsonl raw stream，`application/x-ndjson` content-type；live-tail 留待之後）。
-  - [x] query status（`GET /v1/jobs?limit=N` newest-first list；`GET /v1/jobs/{id}` 回完整 report.json；orphan / 損毀 report 自動 skip）。
+- [x] 建立 `owrtd` Go daemon（HTTP server，net/http stdlib only，無新 deps；`--addr` + `--artifacts-dir` flags；`http.Server{}` 含 read/write/idle timeouts）。
+- [x] 提供本機 API：
+  - [x] submit job（`POST /v1/jobs` 接受 build/run/flash/test payload，Go 產生 `job_<hex>`、設定 `OWRT_MONITOR_JOB_ID`、以 child process 啟動 Python `owrt-monitor`；human output 進 `<run_dir>/runner.log`，structured stdout/stderr 進 `<run_dir>/runner.output.jsonl`）。
+  - [x] cancel job（`POST /v1/jobs/{id}/cancel` 寫 `cancel.flag` marker 進 run_dir，跟 Python `cancel` CLI 同一機制；workflow 主動 poll 該 marker，cooperatively abort；owrtd-launched jobs 會同步把 `runner.json.status` 標成 `cancel_requested` 並記錄 `cancel_requested_at`）。
+  - [x] stream logs（`GET /v1/jobs/{id}/events` 回 events.jsonl raw stream；`GET /v1/jobs/{id}/runner-output` 回 runner stdout/stderr NDJSON，支援 `?tail=N` 與 `?follow=true` live-tail）。
+  - [x] query status（`GET /v1/jobs?limit=N` newest-first list；`started_at` 缺失時 fallback 到 report mtime 排序；`GET /v1/jobs/{id}` 回完整 report.json；`GET /v1/jobs/{id}/runner` 回 Go child process 狀態，若 active PID 已死會 atomic 標成 `orphaned`；orphan / 損毀 report 自動 skip）。
   - [x] list DUT locks（`GET /v1/locks` 讀 `<artifacts_dir>/locks.json`；Python `JobStore` 在每個 lock acquire/release/heartbeat 後 atomic 寫一份 snapshot；Go 端不開 SQLite，無新 dep）。
   - [x] list artifacts（兩條路徑：`GET /v1/jobs/{id}` 含 `artifact` 欄位；`GET /v1/jobs/{id}/files/<path>` 用 `http.FileServer(http.Dir(<job_dir>))` 直接 serve build.log/serial.log/firmware/*.bin，path-traversal 由 stdlib FileServer 守住）。
 - [x] 支援 JSONL or gRPC streaming（events.jsonl 已 stream；gRPC 與 live tail 留待之後）。
-- [ ] Go 負責長時間穩定工作（write side 整批留待之後）：
-  - [ ] process supervision。
-  - [ ] stdout/stderr multiplexing。
-  - [ ] cancellation。
-  - [ ] backpressure。
-  - [ ] log rotation。
-  - [ ] job heartbeat。
-- [ ] Go 負責 resource lock（目前 Python 端 SQLite-backed lock 已穩定；Phase 7 完整接管時再搬）：
-  - [ ] container lock。
-  - [ ] DUT lock。
-  - [ ] serial port lock。
-  - [ ] artifact output lock。
-- [ ] Python orchestrator 透過 API 呼叫 Go runner（write API 完成後做）。
-- [x] 保留 Python-only fallback，方便 debug（Python 端是現行 daily-driver；owrtd 作 read-only 補充）。
+- [x] Go 負責長時間穩定工作（subprocess bridge 版本已完成；完整 workflow engine 搬 Go 另列後續）：
+  - [x] process supervision（第一段：Go 啟動/等待 Python child、reap process，並在 `<run_dir>/runner.json` 記錄 pid/status/exit_code/error）。
+  - [x] stdout/stderr multiplexing（Go 用 pipe 捕捉 child stdout/stderr，寫 human `runner.log` + structured `runner.output.jsonl`，每筆含 `ts/job_id/stream/line`）。
+  - [x] cancellation（Go API 寫入 cooperative cancel marker，並把 owrtd-launched runner 狀態標記為 `cancel_requested`；不直接 SIGKILL，避免跳過 Python cleanup/report）。
+  - [x] backpressure（`--runner-output-max-bytes` 預設 64MiB；超限後 owrtd 繼續 drain stdout/stderr、防止 child 卡住，只寫一次 truncation marker，後續行丟棄，並把 `runner.json.output_truncated=true`）。
+  - [x] log rotation（`--runner-output-rotate-bytes` 預設 16MiB、`--runner-output-rotate-files` 預設 3；`runner.log` 與 `runner.output.jsonl` 會一起輪替成 `.1/.2/.3`，`GET /v1/jobs/{id}/runner-output` 的 raw/tail/follow 會讀 current 加 rotated 檔，並把 `runner.json.output_rotated=true`）。
+  - [x] job heartbeat（Go runner child 還在 running 時，daemon 定期 atomic 更新 `<run_dir>/runner.json.updated_at`）。
+  - [x] daemon restart / stale runner recovery（`GET /v1/jobs/{id}/runner` 會檢查 active runner PID liveness；dead PID 會寫回 `status=orphaned`、`orphaned_at`、`finished_at`、`error`）。
+- [x] Go 負責 resource lock（`GET /v1/locks` 讀同一份 `<artifacts_dir>/locks.json` snapshot；`POST /v1/locks/{dut|builder|serial|artifact}/{name}/{acquire|heartbeat|release}` 用 daemon 內 mutex + atomic rename 寫入，支援 `container` alias、owner 驗證與 heartbeat stale takeover）：
+  - [x] container lock（`builder` / `container` kind 對應 `builder_locks`）。
+  - [x] DUT lock（`dut_locks`）。
+  - [x] serial port lock（`serial_locks`）。
+  - [x] artifact output lock（`artifact_locks`）。
+- [x] Python orchestrator 透過 API 呼叫 Go runner（`build` / `run` / `flash` / `test` / `dry-run` 支援 `--daemon-url http://127.0.0.1:8765`，會 POST `/v1/jobs`，由 owrtd 啟動 child workflow；預設仍保留 Python-only fallback）。
+- [x] 保留 Python-only fallback，方便 debug（Python 端是現行 daily-driver；owrtd write-side 先以 subprocess bridge 漸進接管）。
 
 ## Phase 8 - iTerm2/tmux Observer
 
@@ -262,7 +265,12 @@ When opening a new slice, check this bucket first — most "open" items are deli
 > A web dashboard talking to owrtd's read-only API is now a viable
 > alternative path that avoids AppleScript altogether.
 
-- [ ] 不把 iTerm2 tab 當自動化核心（design principle，不需 implementation；已遵守）。
+- [x] 不把 iTerm2 tab 當自動化核心（design principle，不需 implementation；已遵守）。
+- [x] 提供 UI-friendly advisory artifact：`owrt-monitor analyze <job_id|run_dir>`
+  產生 `analysis.json` / `analysis.md`，owrtd 以
+  `GET /v1/jobs/{id}/analysis` read-only 提供給後續 dashboard。
+- [x] 提供 read-only web dashboard：`GET /ui/` 直接由 owrtd 服務，讀
+  `/v1/jobs`、report、runner、analysis、events、runner-output；沒有 submit/cancel/flash action。
 - [ ] 提供 tmux session observer（DEFERRED）：
   - [ ] build log pane。
   - [ ] serial log pane。
@@ -285,17 +293,17 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 - [ ] LLM 僅作為輔助分析，不直接執行 dangerous action（design principle；deterministic config + workflow 永遠是 authority）。
 - [ ] 可用功能（DEFERRED）：
-  - [ ] summarize build failure（已有 build_log classifier；LLM 是 nice-to-have 的人類友善 summary）。
-  - [ ] classify OpenWrt errors（同上）。
-  - [ ] suggest next action（DEFERRED；可能跟 troubleshooting.md 的 recovery recipes 衝突，需要 careful design）。
-  - [ ] generate bug report draft（DEFERRED）。
+  - [x] summarize build failure（第一段為 deterministic advisory analysis；已有 build_log classifier，後續 LLM 只 consume `analysis.json`）。
+  - [x] classify OpenWrt errors（第一段為 deterministic build_log classifier + advisory findings）。
+  - [x] suggest next action（deterministic advisory `next_actions`，不執行任何動作）。
+  - [x] generate bug report draft（deterministic redacted `bug_report_draft` in `analysis.json` / `analysis.md`）。
   - [ ] summarize DUT boot failure（DEFERRED；目前 BootFailureError 的 evidence + serial.log 已足夠人工 triage）。
-- [ ] LLM action guardrails（DEFERRED；上面任一功能落地時必須先實作這些）：
-  - [ ] structured input only。
-  - [ ] no secret in prompt（已有 redacted_dump 機制可重用）。
-  - [ ] dangerous command requires explicit approval。
-  - [ ] deterministic workflow remains source of truth（design principle；現行架構已遵守）。
-- [ ] 保存 LLM analysis 與原始 log 的對應關係（DEFERRED）。
+- [x] LLM action guardrails（第一段落地於 `analysis.json`；真正外部 LLM provider 仍 DEFERRED）：
+  - [x] structured input only。
+  - [x] no secret in prompt（common secret-shaped tokens redacted；config snapshot 仍用 redacted_dump）。
+  - [x] dangerous command requires explicit approval（analysis marks `dangerous_actions_allowed=false`）。
+  - [x] deterministic workflow remains source of truth（design principle；現行架構已遵守）。
+- [x] 保存 LLM analysis 與原始 log 的對應關係（`source_files` sha256 + evidence file/line refs）。
 
 ## Phase 10 - Reliability and Operations
 
@@ -305,12 +313,12 @@ When opening a new slice, check this bucket first — most "open" items are deli
   - [x] build duration（從 `build_summary.duration_sec` 抽出，已從 `>>>> ... Build done in: MM:SS.fff` 解析）。
   - [x] flash duration（`metrics.flash_duration_sec` = `boot_duration_sec`：sysupgrade write → shell prompt 回來的 wall-clock；同一量兩個別名以利 Phase 10 query 命名）。
   - [x] boot duration（sysupgrade write → prompt 回來的 wall-clock，DutWorkflow 量測；DUT_ONLINE event 的 fields 也帶）。
-  - [x] test duration（smoke_duration_sec：整個 smoke 迴圈，含 setup overhead）。
+  - [x] test duration（`test_duration_sec`：serial smoke + host scripts + host pytest + host SSH 全部 wall-clock；`smoke_duration_sec` / `script_duration_sec` / `pytest_duration_sec` / `ssh_duration_sec` 保留分段時間）。
   - [x] success rate（`owrt-monitor metrics`：counts_by_result + success/(success+failed)；含 mean/median/p90/min/max 區段）。
 - [x] 支援 job history browser（`owrt-monitor inspect <job_id>` 印單一 job 全表；`owrt-monitor inspect <a> --diff <b>` 並排比對 artifact / provenance / build summary / metrics / DUT status）。
-- [ ] 支援 crash recovery（部分；daemon recovery 等待 Phase 7）：
-  - [ ] daemon restart 後恢復 job 狀態（Phase 7 owrtd 實作後；目前 Python-only 流程 crash 後 orphan job 透過 PID liveness + lock stale-recovery 在下次手動跑時自動處理）。
-  - [x] serial session stale lock cleanup（DUT 與 builder lock 都有 `lock_timeout_sec` + heartbeat-based stale recovery；下個 acquire 自動 break + take over，emit 結構化 event）。
+- [x] 支援 crash recovery（daemon runner stale reconciliation、Python lock stale takeover、Go lock stale takeover、orphan marking、artifact pruning 均已覆蓋）：
+  - [x] daemon restart 後恢復 runner 狀態（owrtd-launched job 的 `runner.json` 若停在 active 狀態但 PID 已死，`GET /v1/jobs/{id}/runner` 會標成 `orphaned` 並寫回檔案）。
+  - [x] serial session stale lock cleanup（DUT 與 builder lock 都有 `lock_timeout_sec` + heartbeat-based stale recovery；下個 acquire 自動 break + take over。`owrt-monitor status --mark-orphans` 可把 dead-PID job 標成 FAILED/orphan、寫 `job_orphaned` event、並立即釋放該 job 持有的 DUT/builder locks）。
   - [x] partial artifact cleanup（`owrt-monitor prune --keep-success N --keep-failed M`：dry-run by default；保留 SQLite audit trail，只清 run_dir 內容）。
 - [x] 支援 dry-run/rehearsal mode（`owrt-monitor dry-run` 子指令；其他子指令（build/run/flash/test/resume）也支援 `--dry-run`；計畫的 actions 會印在 `report.md` 但不觸發任何 docker 或 DUT 操作）。
 - [x] 支援 config diff before run（每個新 BuildWorkflow.run / FlashWorkflow.run 啟動時，跟最近一次 SUCCEEDED job 的 config_snapshot diff，差異總數 + 前三個欄位寫進 `## Actions` 段；完整 sample 進 `config_diff_from_last_success` event）。
@@ -318,17 +326,17 @@ When opening a new slice, check this bucket first — most "open" items are deli
 
 ## Phase 11 - CI and Test Coverage
 
-- [x] Python unit tests（170+ tests across 22 modules，包含真實 lab 從 build.log fixtures）：
+- [x] Python unit tests（223 tests across 35 modules，包含真實 lab 從 build.log fixtures）：
   - [x] config parser（`test_config.py`：env interpolation、redacted dump、profile 驗證）。
   - [x] state machine（`test_workflow_integration.py` 用 `events.jsonl` 驗 12-state transition；transition recorded before side-effect）。
   - [x] artifact matching（`test_artifacts.py`：newest/largest/fail-if-multiple、min_size_mb 過濾）。
   - [x] serial prompt parser（`test_dut_serial.py` + `test_login.py`：read_until / read_until_one_of / failure patterns / 密碼 redact）。
   - [x] log parser（`test_build_log.py`：success / disk_full / failed_package / compile_error，含真實 lab build.log fixture）。
-- [ ] Go unit tests（owrtd 已有，runner / locks / streaming 等待 Phase 7）：
-  - [ ] process runner（Phase 7 Go runner 實作後）。
-  - [ ] log streaming（Phase 7）。
-  - [ ] lock manager（Phase 7；目前 lock 邏輯在 Python 端 sqlite-backed）。
-  - [x] API handlers（`cmd/owrtd/main_test.go`：22 個 test 涵蓋 `/healthz`、`/v1/jobs?limit=`、`/v1/jobs/{id}`、`/v1/jobs/{id}/events`、`/v1/jobs/{id}/cancel`、`/v1/jobs/{id}/files/<path>`（含 nested firmware、path-traversal 三種 vector、404 missing、POST 405）、各 method gate、isSafeJobID 邊界、損毀 report.json 跳過；CI 跑 `go test ./...`）。
+- [x] Go unit tests（owrtd runner / locks / streaming / handlers 已有覆蓋）：
+  - [x] process runner（submit bridge、runner status、heartbeat、stdout/stderr structured capture、stale PID reconciliation、output truncation/backpressure）。
+  - [x] log streaming（events stream + runner stdout/stderr `tail` / `follow`）。
+  - [x] lock manager（DUT / builder-container / serial / artifact locks，含 conflict、stale takeover、heartbeat、owner release 驗證）。
+  - [x] API handlers（`cmd/owrtd/main_test.go`：52 個 test 涵蓋 `/healthz`、`/ui/` dashboard、`POST /v1/jobs` submit bridge、runner heartbeat、stale runner PID reconciliation、stdout/stderr structured capture、runner output truncation/backpressure、runner output rotation、Go resource locks、`/v1/jobs?limit=`（含 report mtime sort fallback）、`/v1/jobs/{id}`、`/v1/jobs/{id}/analysis`、`/v1/jobs/{id}/events`、`/v1/jobs/{id}/runner`、`/v1/jobs/{id}/runner-output`（含 raw/tail/follow/bad-tail/404/rotated tail）、`/v1/jobs/{id}/cancel`、`/v1/jobs/{id}/files/<path>`（含 nested firmware、path-traversal 三種 vector、404 missing、POST 405）、各 method gate、isSafeJobID 邊界、損毀 report.json 跳過；CI 跑 `go test ./...`）。
 - [x] Integration tests with fake DUT（`test_workflow_integration.py:test_build_workflow_full_flow_with_allow_flash`）：
   - [x] pseudo terminal（`_FakeSerialTransport` 注入到 `SerialSession`，跳過 pyserial）。
   - [x] simulated boot log（`b"rebooting\n" + prompt` 驅動 read_until 通過 reboot wait）。

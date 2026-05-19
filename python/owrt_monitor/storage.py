@@ -227,6 +227,29 @@ class JobStore:
             )
         self._refresh_locks_snapshot()
 
+    def release_locks_for_job(self, *, owner_job_id: str) -> dict[str, int]:
+        """Release all DUT and builder locks owned by a job.
+
+        Used by orphan recovery after the recorded PID is known dead. Normal
+        workflows should still release their precise locks in `finally`.
+        """
+        with self._connect() as connection:
+            dut_cursor = connection.execute(
+                "DELETE FROM dut_locks WHERE owner_job_id = ?",
+                (owner_job_id,),
+            )
+            builder_cursor = connection.execute(
+                "DELETE FROM builder_locks WHERE owner_job_id = ?",
+                (owner_job_id,),
+            )
+            released = {
+                "dut_locks": max(dut_cursor.rowcount, 0),
+                "builder_locks": max(builder_cursor.rowcount, 0),
+            }
+        if released["dut_locks"] or released["builder_locks"]:
+            self._refresh_locks_snapshot()
+        return released
+
     def _refresh_locks_snapshot(self) -> None:
         """Atomically write `<db_dir>/locks.json` with the current lock state.
 
@@ -253,12 +276,15 @@ class JobStore:
                 ]
         except sqlite3.Error:
             return  # snapshot is best-effort; never fail the caller
+        snapshot_path = self.path.parent / "locks.json"
+        existing_extra = _read_non_sql_locks(snapshot_path)
         payload = {
             "generated_at": _now(),
             "dut_locks": duts,
             "builder_locks": builders,
+            "serial_locks": existing_extra["serial_locks"],
+            "artifact_locks": existing_extra["artifact_locks"],
         }
-        snapshot_path = self.path.parent / "locks.json"
         tmp_path = snapshot_path.with_suffix(".json.tmp")
         try:
             tmp_path.write_text(
@@ -503,6 +529,18 @@ class JobStore:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _read_non_sql_locks(snapshot_path: Path) -> dict[str, list[dict[str, Any]]]:
+    try:
+        payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"serial_locks": [], "artifact_locks": []}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for key in ("serial_locks", "artifact_locks"):
+        value = payload.get(key)
+        out[key] = value if isinstance(value, list) else []
+    return out
 
 
 def _is_stale(heartbeat_iso: str, lock_timeout_sec: int) -> bool:

@@ -1,20 +1,31 @@
-// owrtd is the read-only HTTP-facing companion to the Python orchestrator.
+// owrtd is the HTTP-facing companion to the Python orchestrator.
 //
 // The Python `BuildWorkflow` writes per-job state to disk under
 // `project.artifact_dir`, including `report.json` (final summary) and
 // `events.jsonl` (per-event stream). owrtd surfaces those files over HTTP
-// without re-implementing the workflow engine — Phase 7 of the roadmap
-// reserves the write-side (submit/cancel/lock) for a later milestone.
+// without re-implementing the workflow engine. The first write-side slice
+// accepts job submissions and launches the Python CLI as a supervised child
+// process; Python remains the workflow engine until Phase 7 fully migrates
+// execution into Go.
 //
 // Endpoints today:
-//   GET  /healthz                          → {"status": "ok"}
-//   GET  /v1/jobs?limit=N                   → [{job_id, ...}, ...]   (newest first)
-//   GET  /v1/jobs/{id}                      → full report.json
-//   GET  /v1/jobs/{id}/events               → raw events.jsonl bytes
-//   GET  /v1/jobs/{id}/files/<path>         → serve files from the run_dir
-//   POST /v1/jobs/{id}/cancel               → write cancel.flag marker
-//   GET  /v1/locks                          → current DUT + builder locks
-//   POST /v1/jobs                           → 501 stub (submit-job reserved)
+//
+//	GET  /healthz                          → {"status": "ok"}
+//	GET  /ui/                              → job dashboard
+//	GET  /v1/jobs?limit=N                   → [{job_id, ...}, ...]   (newest first)
+//	GET  /v1/jobs/{id}                      → full report.json
+//	DELETE /v1/jobs/{id}                    → remove the on-disk job directory
+//	GET  /v1/jobs/{id}/analysis             → advisory analysis.json
+//	GET  /v1/jobs/{id}/events               → raw events.jsonl bytes
+//	GET  /v1/jobs/{id}/runner               → Go runner child-process status
+//	GET  /v1/jobs/{id}/runner-output        → structured stdout/stderr NDJSON
+//	GET  /v1/jobs/{id}/files/<path>         → serve files from the run_dir
+//	POST /v1/jobs/{id}/cancel               → write cancel.flag marker
+//	GET  /v1/locks                          → current DUT + builder locks
+//	POST /v1/locks/{dut|builder|serial|artifact}/{name}/acquire
+//	POST /v1/locks/{dut|builder|serial|artifact}/{name}/heartbeat
+//	POST /v1/locks/{dut|builder|serial|artifact}/{name}/release
+//	POST /v1/jobs                           → launch a Python workflow subprocess
 //
 // Storage of truth is the on-disk run directories. SQLite is intentionally
 // not opened from Go: it would add a cgo or pure-Go dep we don't need until
@@ -22,50 +33,25 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
-	"os"
 	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
 	"time"
 )
-
-type healthResponse struct {
-	Status string `json:"status"`
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
-
-// jobsListEntry is the trimmed shape returned by /v1/jobs. Mirrors the
-// most-useful fields from the Python `report.json` so a UI can render a
-// list without reading every report.
-type jobsListEntry struct {
-	JobID      string `json:"job_id"`
-	State      string `json:"state"`
-	Success    bool   `json:"success"`
-	DryRun     bool   `json:"dry_run"`
-	StartedAt  string `json:"started_at,omitempty"`
-	FinishedAt string `json:"finished_at,omitempty"`
-	RunDir     string `json:"run_dir"`
-}
-
-type server struct {
-	artifactsDir string
-}
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8765", "HTTP listen address")
 	root := flag.String("artifacts-dir", "./artifacts",
 		"path that contains the per-job run directories (Python's project.artifact_dir)")
+	runnerBin := flag.String("owrt-monitor-bin", "owrt-monitor",
+		"owrt-monitor executable used by POST /v1/jobs")
+	runnerOutputMaxBytes := flag.Int64("runner-output-max-bytes", 64*1024*1024,
+		"maximum bytes written to runner.log and runner.output.jsonl per job before truncating output; <=0 disables")
+	runnerOutputRotateBytes := flag.Int64("runner-output-rotate-bytes", 16*1024*1024,
+		"maximum bytes kept in the active runner.log and runner.output.jsonl files before rotating to .1; <=0 disables")
+	runnerOutputRotateFiles := flag.Int("runner-output-rotate-files", 3,
+		"number of rotated runner output files to keep when rotation is enabled; <=0 keeps 1")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*root)
@@ -73,13 +59,21 @@ func main() {
 		log.Fatalf("resolve artifacts-dir: %v", err)
 	}
 
-	srv := &server{artifactsDir: abs}
+	srv := &server{
+		artifactsDir:            abs,
+		runnerBin:               *runnerBin,
+		runnerOutputMaxBytes:    *runnerOutputMaxBytes,
+		runnerOutputRotateBytes: *runnerOutputRotateBytes,
+		runnerOutputRotateFiles: *runnerOutputRotateFiles,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
+	mux.HandleFunc("/", srv.handleDashboard)
 	mux.HandleFunc("/v1/jobs", srv.handleJobs)
 	// `/v1/jobs/{id}` and its sub-resources are dispatched by handleJobByID.
 	mux.HandleFunc("/v1/jobs/", srv.handleJobByID)
 	mux.HandleFunc("/v1/locks", srv.handleLocks)
+	mux.HandleFunc("/v1/locks/", srv.handleLockByID)
 
 	// owrtd is intended for localhost-only access (default 127.0.0.1) and
 	// reads from the same machine's filesystem; it does not handle traffic
@@ -101,341 +95,4 @@ func main() {
 
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
-}
-
-// handleLocks reads `<artifactsDir>/locks.json` (Python writes it on every
-// lock mutation) and surfaces the current DUT + builder lock state. Going
-// through a JSON snapshot file rather than opening SQLite from Go keeps the
-// daemon dep-free.
-func (s *server) handleLocks(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
-		return
-	}
-	path := filepath.Join(s.artifactsDir, "locks.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// No locks ever taken in this artifacts dir — return an empty
-			// payload so a UI doesn't have to special-case "first run".
-			writeJSON(w, http.StatusOK, map[string]any{
-				"generated_at":  "",
-				"dut_locks":     []any{},
-				"builder_locks": []any{},
-			})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
-		return
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{
-			Error: fmt.Sprintf("locks.json is not valid JSON: %v", err),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, payload)
-}
-
-func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		// Mutation API still reserved for a later milestone; preserve the
-		// historical 501 so Python's fallback decision logic can detect it.
-		writeJSON(w, http.StatusNotImplemented, errorResponse{
-			Error: "owrtd job mutation API is reserved for a later runner milestone",
-		})
-		return
-	}
-
-	limit := 50
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > 1000 {
-			writeJSON(w, http.StatusBadRequest, errorResponse{
-				Error: "limit must be an integer in [1, 1000]",
-			})
-			return
-		}
-		limit = parsed
-	}
-
-	entries, err := s.listJobs(limit)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, entries)
-}
-
-// handleJobByID dispatches `/v1/jobs/{id}` and its sub-resources.
-//
-// Method matrix:
-//
-//	GET  /v1/jobs/{id}             → report.json
-//	GET  /v1/jobs/{id}/events      → events.jsonl stream
-//	POST /v1/jobs/{id}/cancel      → write cancel.flag marker
-//	any other combination          → 404 or 405 with a JSON error body
-func (s *server) handleJobByID(w http.ResponseWriter, r *http.Request) {
-	rest := strings.TrimPrefix(r.URL.Path, "/v1/jobs/")
-	if rest == "" {
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "missing job id"})
-		return
-	}
-	parts := strings.SplitN(rest, "/", 2)
-	jobID := parts[0]
-	if !isSafeJobID(jobID) {
-		writeJSON(w, http.StatusBadRequest, errorResponse{
-			Error: "job id must contain only alphanumerics, underscore, or hyphen",
-		})
-		return
-	}
-
-	if len(parts) == 1 {
-		// Bare /v1/jobs/{id} — GET only.
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
-			return
-		}
-		s.serveReport(w, jobID)
-		return
-	}
-
-	// Some sub-resources (e.g. files/<path>) keep nested path components.
-	subhead, subtail, hasSubtail := strings.Cut(parts[1], "/")
-	switch subhead {
-	case "events":
-		if hasSubtail {
-			writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
-			return
-		}
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
-			return
-		}
-		s.serveEvents(w, jobID)
-	case "cancel":
-		if hasSubtail {
-			writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
-			return
-		}
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "POST only"})
-			return
-		}
-		s.serveCancel(w, jobID)
-	case "files":
-		if r.Method != http.MethodGet {
-			writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "GET only"})
-			return
-		}
-		s.serveFiles(w, r, jobID, subtail)
-	default:
-		writeJSON(w, http.StatusNotFound, errorResponse{Error: "no such sub-resource"})
-	}
-}
-
-func (s *server) serveReport(w http.ResponseWriter, jobID string) {
-	path := filepath.Join(s.artifactsDir, jobID, "report.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeJSON(w, http.StatusNotFound, errorResponse{
-				Error: "no such job (or report.json not yet written)",
-			})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
-		return
-	}
-	// Decode into a generic map and re-encode through json.NewEncoder. Two
-	// reasons: (a) validates the payload before responding, surfacing a
-	// corrupt report.json clearly instead of streaming garbage; (b) routes
-	// every byte through the same encoder used by writeJSON, so output is
-	// uniformly JSON (no accidental partial-binary leakage from a torn
-	// file read).
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{
-			Error: fmt.Sprintf("report.json is not valid JSON: %v", err),
-		})
-		return
-	}
-	writeJSON(w, http.StatusOK, payload)
-}
-
-func (s *server) serveFiles(w http.ResponseWriter, r *http.Request, jobID, subPath string) {
-	// http.FileServer + http.Dir is the standard way to serve a sandboxed
-	// directory tree. http.Dir.Open rejects requests that would escape the
-	// root via `..` segments — we still validate the job dir exists first
-	// to return a clean 404 instead of leaking that detail through the
-	// FileServer error.
-	jobDir := filepath.Join(s.artifactsDir, jobID)
-	info, err := os.Stat(jobDir)
-	if err != nil || !info.IsDir() {
-		writeJSON(w, http.StatusNotFound, errorResponse{
-			Error: "no such job (run directory does not exist)",
-		})
-		return
-	}
-	if subPath == "" {
-		// Treat /v1/jobs/{id}/files (no trailing path) as a directory listing.
-		subPath = "/"
-	}
-	// Re-shape the request URL so http.FileServer sees the path scoped
-	// inside the job dir. We don't mutate the original request — make a
-	// shallow copy with rewritten URL.path.
-	scoped := *r
-	urlCopy := *r.URL
-	urlCopy.Path = "/" + strings.TrimPrefix(subPath, "/")
-	scoped.URL = &urlCopy
-	http.FileServer(http.Dir(jobDir)).ServeHTTP(w, &scoped)
-}
-
-func (s *server) serveCancel(w http.ResponseWriter, jobID string) {
-	// The Python orchestrator polls `<run_dir>/cancel.flag` between every
-	// step. Writing the file is equivalent to `owrt-monitor cancel <id>` —
-	// no daemon-internal state needed, no new IPC mechanism.
-	jobDir := filepath.Join(s.artifactsDir, jobID)
-	info, err := os.Stat(jobDir)
-	if err != nil || !info.IsDir() {
-		writeJSON(w, http.StatusNotFound, errorResponse{
-			Error: "no such job (run directory does not exist)",
-		})
-		return
-	}
-	marker := filepath.Join(jobDir, "cancel.flag")
-	if err := os.WriteFile(marker, []byte("requested\n"), 0o644); err != nil {
-		writeJSON(w, http.StatusInternalServerError, errorResponse{
-			Error: fmt.Sprintf("write cancel marker: %v", err),
-		})
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{
-		"job_id":      jobID,
-		"marker_path": marker,
-		"status":      "cancellation requested",
-	})
-}
-
-func (s *server) serveEvents(w http.ResponseWriter, jobID string) {
-	path := filepath.Join(s.artifactsDir, jobID, "events.jsonl")
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			writeJSON(w, http.StatusNotFound, errorResponse{
-				Error: "no events.jsonl for that job",
-			})
-			return
-		}
-		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: err.Error()})
-		return
-	}
-	defer f.Close()
-	w.Header().Set("Content-Type", "application/x-ndjson")
-	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, f); err != nil {
-		log.Printf("events.jsonl copy for %s: %v", jobID, err)
-	}
-}
-
-// listJobs walks the artifacts dir, reads each `report.json`, and returns
-// up to `limit` entries newest-first by `started_at`. Jobs whose report
-// file is missing or malformed are skipped (an in-flight job whose first
-// `report.json` write hasn't happened yet still appears in `status` via
-// the Python SQLite path; this Go endpoint is best-effort).
-func (s *server) listJobs(limit int) ([]jobsListEntry, error) {
-	entries, err := os.ReadDir(s.artifactsDir)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return []jobsListEntry{}, nil
-		}
-		return nil, fmt.Errorf("read artifacts dir: %w", err)
-	}
-
-	var out []jobsListEntry
-	for _, dirent := range entries {
-		if !dirent.IsDir() {
-			continue
-		}
-		name := dirent.Name()
-		if !strings.HasPrefix(name, "job_") {
-			continue
-		}
-		entry, ok := s.readJobEntry(name)
-		if !ok {
-			continue
-		}
-		out = append(out, entry)
-	}
-
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].StartedAt > out[j].StartedAt
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
-}
-
-func (s *server) readJobEntry(jobID string) (jobsListEntry, bool) {
-	path := filepath.Join(s.artifactsDir, jobID, "report.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return jobsListEntry{}, false
-	}
-	// Decode just the fields we care about; the report has many others.
-	var partial struct {
-		JobID      string `json:"job_id"`
-		State      string `json:"state"`
-		Success    bool   `json:"success"`
-		DryRun     bool   `json:"dry_run"`
-		RunDir     string `json:"run_dir"`
-		StartedAt  string `json:"started_at"`
-		FinishedAt string `json:"finished_at"`
-	}
-	if err := json.Unmarshal(data, &partial); err != nil {
-		return jobsListEntry{}, false
-	}
-	if partial.JobID == "" {
-		partial.JobID = jobID
-	}
-	return jobsListEntry{
-		JobID:      partial.JobID,
-		State:      partial.State,
-		Success:    partial.Success,
-		DryRun:     partial.DryRun,
-		StartedAt:  partial.StartedAt,
-		FinishedAt: partial.FinishedAt,
-		RunDir:     partial.RunDir,
-	}, true
-}
-
-// isSafeJobID guards path construction. Job IDs from Python are
-// `job_<12-hex>` so the regex of allowed chars is small. Anything that
-// isn't strictly alphanumeric / `_` / `-` is rejected before we touch
-// the filesystem — defends against `..` and absolute-path injection.
-func isSafeJobID(id string) bool {
-	if id == "" {
-		return false
-	}
-	for _, r := range id {
-		switch {
-		case r >= 'a' && r <= 'z':
-		case r >= 'A' && r <= 'Z':
-		case r >= '0' && r <= '9':
-		case r == '_' || r == '-':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(value); err != nil {
-		log.Printf("write response: %v", err)
-	}
 }

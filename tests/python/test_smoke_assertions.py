@@ -95,6 +95,22 @@ def test_smoke_fails_when_expect_does_not_match(tmp_path: Path) -> None:
     assert "DOWN" in r.output
 
 
+def test_smoke_entry_can_be_skipped(tmp_path: Path) -> None:
+    workflow, session, transport = _make_workflow_with_serial(
+        tmp_path,
+        smoke=[{"command": "uptime", "expect": r"\d+", "enabled": False}],
+        chunks=[b"root@OpenWrt:/# "],
+    )
+    session.connect()
+    session.send_newline()
+    session.read_until_prompt(timeout_sec=1)
+    results = workflow.run_smoke_tests(session)
+    assert len(results) == 1
+    assert results[0].skipped is True
+    assert results[0].passed is False
+    assert transport.writes == [b"\n"]  # no command write after initial prompt setup
+
+
 def test_smoke_test_dataclass_has_assertion_default() -> None:
     """SmokeTest with no expect should map to assertion=None on the result."""
     entry = SmokeTest(command="uptime")

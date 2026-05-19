@@ -8,6 +8,7 @@ from fake_docker import FakeDockerBuildClient, FakeFirmwareServer
 from owrt_monitor.cancel import CancelToken
 from owrt_monitor.config import BuilderConfig, load_config
 from owrt_monitor.dut_serial import SerialSession
+from owrt_monitor.dut_workflow import DutWorkflowError
 from owrt_monitor.state import JobState
 from owrt_monitor.storage import JobStore
 from owrt_monitor.workflow import (
@@ -20,23 +21,32 @@ from owrt_monitor.workflow import (
 class _FakeSerialTransport:
     """Returns canned chunks for each successive read; writes go to a list."""
 
-    def __init__(self, chunks: list[bytes]) -> None:
+    def __init__(self, chunks: list[bytes | BaseException]) -> None:
         self.chunks = list(chunks)
         self.writes: list[bytes] = []
+        self.closed = False
 
     @property
     def in_waiting(self) -> int:
-        return len(self.chunks[0]) if self.chunks else 0
+        if not self.chunks:
+            return 0
+        chunk = self.chunks[0]
+        return 1 if isinstance(chunk, BaseException) else len(chunk)
 
     def read(self, size: int = 1) -> bytes:
-        return self.chunks.pop(0) if self.chunks else b""
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        if isinstance(chunk, BaseException):
+            raise chunk
+        return chunk
 
     def write(self, data: bytes) -> int:
         self.writes.append(data)
         return len(data)
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 def _write_config(tmp_path: Path, **overrides: dict) -> Path:
@@ -250,6 +260,26 @@ def test_build_workflow_handles_preflight_failure_cleanly(tmp_path: Path) -> Non
     assert record["result"] == "failed"
 
 
+def test_run_with_flash_checks_serial_before_build_preflight(monkeypatch, tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path)
+    fake = FakeDockerBuildClient(builder=_builder_from_config(config_path))
+
+    def fail_serial_preflight(self):
+        raise DutWorkflowError("serial console is not interactive on /dev/fake")
+
+    monkeypatch.setattr(
+        "owrt_monitor.dut_workflow.DutWorkflow.preflight_serial_interactive",
+        fail_serial_preflight,
+    )
+    workflow = BuildWorkflow(config_path, docker_client=fake)
+
+    with pytest.raises(WorkflowError, match=r"serial console is not interactive"):
+        workflow.run(dry_run=False, allow_flash=True)
+
+    assert fake.preflight_calls == 0
+    assert fake.run_build_calls == 0
+
+
 def test_build_workflow_classifies_disk_full_failure(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     fake = FakeDockerBuildClient(
@@ -436,6 +466,158 @@ def test_build_workflow_full_flow_with_allow_flash(tmp_path: Path) -> None:
     assert workflow.store.acquire_dut_lock(
         dut_name=config.dut.name, owner_job_id="next_job"
     ) is True
+
+
+def test_build_workflow_reconnects_serial_during_reboot_wait(tmp_path: Path) -> None:
+    """End-to-end reboot wait should tolerate a USB serial drop and keep going."""
+    raw = yaml.safe_load(_write_config(tmp_path).read_text(encoding="utf-8"))
+    raw["upgrade"] = {
+        "transfer": "http",
+        "remote_path": "/tmp/firmware.bin",
+        "command": "sysupgrade -n /tmp/firmware.bin",
+        "boot_timeout_sec": 5,
+        "transfer_timeout_sec": 5,
+        "http_host": "127.0.0.1",
+        "verify_sha256": True,
+    }
+    raw["dut"] = {
+        "name": "dut-int",
+        "serial": "/dev/fake",
+        "prompt": r"root@OpenWrt:.*# ",
+        "connect_timeout_sec": 1,
+        "command_timeout_sec": 1,
+    }
+    raw["tests"] = {
+        "smoke": ["ubus call system board"],
+        "command_timeout_sec": 1,
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = load_config(config_path)
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = (
+        b'{"kernel":"5.15.0","hostname":"OpenWrt","board_name":"mt7987",'
+        b'"release":{"distribution":"OpenWrt","version":"22.03"}}\n'
+    )
+    first_transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"download ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            OSError("serial device disappeared during reboot"),
+        ]
+    )
+    second_transport = _FakeSerialTransport(
+        [
+            b"rebooted after reconnect\n" + prompt,
+            status_json + prompt,
+            b"board ok\n" + prompt,
+        ]
+    )
+    transports = [first_transport, second_transport]
+
+    def transport_factory() -> _FakeSerialTransport:
+        return transports.pop(0)
+
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport_factory=transport_factory,
+    )
+
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=FakeDockerBuildClient(builder=config.builder),
+        dut_workflow_kwargs={
+            "serial_session": fake_session,
+            "firmware_server": FakeFirmwareServer(port=8888),
+        },
+    )
+    report = workflow.run(dry_run=False, allow_flash=True)
+
+    assert report.success is True
+    assert report.state == JobState.SUCCEEDED.value
+    assert first_transport.closed is True
+    assert b"sysupgrade -n" in b"".join(first_transport.writes)
+    assert second_transport.writes[0] == b"\n"
+    transcript = (tmp_path / "serial.log").read_text(encoding="utf-8")
+    assert "serial I/O error" in transcript
+    assert "serial reconnected" in transcript
+
+
+def test_build_workflow_fails_when_post_upgrade_smoke_fails(tmp_path: Path) -> None:
+    raw = yaml.safe_load(_write_config(tmp_path).read_text(encoding="utf-8"))
+    raw["upgrade"] = {
+        "transfer": "http",
+        "remote_path": "/tmp/firmware.bin",
+        "command": "sysupgrade -n /tmp/firmware.bin",
+        "boot_timeout_sec": 5,
+        "transfer_timeout_sec": 5,
+        "http_host": "127.0.0.1",
+        "verify_sha256": True,
+    }
+    raw["dut"] = {
+        "name": "dut-int",
+        "serial": "/dev/fake",
+        "prompt": r"root@OpenWrt:.*# ",
+        "connect_timeout_sec": 1,
+        "command_timeout_sec": 1,
+    }
+    raw["tests"] = {
+        "smoke": [{"command": "cat /proc/uptime", "expect": r"^UP$"}],
+        "command_timeout_sec": 1,
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = load_config(config_path)
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"download ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            b"rebooted\n" + prompt,
+            status_json + prompt,
+            b"123.45 67.89\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=FakeDockerBuildClient(builder=config.builder),
+        dut_workflow_kwargs={
+            "serial_session": fake_session,
+            "firmware_server": FakeFirmwareServer(port=8888),
+        },
+    )
+
+    with pytest.raises(WorkflowError, match=r"post-upgrade tests failed.*smoke"):
+        workflow.run(dry_run=False, allow_flash=True)
+
+    run_dirs = sorted((tmp_path / "artifacts").glob("job_*"))
+    assert len(run_dirs) == 1
+    report_md = (run_dirs[0] / "report.md").read_text(encoding="utf-8")
+    assert "State: `FAILED`" in report_md
+    assert "## Smoke Tests" in report_md
+    assert "Result: **FAIL**" in report_md
+    assert "`cat /proc/uptime`: failed" in report_md
+    rows = JobStore(config.state_db_path(config_path)).recent_metrics(limit=1)
+    assert rows[0]["result"] == "failed"
+    assert rows[0]["metrics"]["test_duration_sec"] >= rows[0]["metrics"]["smoke_duration_sec"]
 
 
 def test_build_workflow_does_not_invoke_docker_during_dry_run(tmp_path: Path) -> None:

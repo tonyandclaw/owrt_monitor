@@ -77,3 +77,75 @@ dut:
     assert redacted["builder"]["env"]["NORMAL_FLAG"] == "1"
     assert redacted["builder"]["env"]["API_TOKEN"] == "<redacted>"
     assert redacted["dut"]["login"]["password"] == "<redacted>"
+
+
+def test_custom_transfer_requires_command(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+builder:
+  container: test-builder
+  workdir: /work/openwrt
+  command: [make]
+artifact:
+  patterns: ["bin/*.bin"]
+upgrade:
+  transfer: custom
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="custom_transfer_command is required"):
+        load_config(path)
+
+
+def test_custom_transfer_rejects_unknown_placeholder(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+builder:
+  container: test-builder
+  workdir: /work/openwrt
+  command: [make]
+artifact:
+  patterns: ["bin/*.bin"]
+upgrade:
+  transfer: custom
+  custom_transfer_command:
+    - cp
+    - "{artifact}"
+    - "{dut_ip}:{remote_path}"
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=r"unknown placeholder \{dut_ip\}"):
+        load_config(path)
+
+
+def test_custom_transfer_allows_escaped_literal_braces(tmp_path: Path) -> None:
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        """
+builder:
+  container: test-builder
+  workdir: /work/openwrt
+  command: [make]
+artifact:
+  patterns: ["bin/*.bin"]
+upgrade:
+  transfer: custom
+  custom_transfer_command:
+    - sh
+    - -c
+    - 'printf "{{ok}}" > /tmp/marker && cp "$1" "$2"'
+    - sh
+    - "{artifact}"
+    - "{dut_address}:{remote_path}"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.upgrade.custom_transfer_command[2].startswith("printf")

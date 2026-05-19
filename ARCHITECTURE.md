@@ -396,6 +396,12 @@ Locks should include:
 - heartbeat timestamp。
 - stale lock policy。
 
+Current implementation keeps Python's SQLite-backed DUT/builder locks for the
+daily-driver workflow and writes `<artifacts_dir>/locks.json` after each
+mutation. owrtd reads that snapshot and can also mutate Go-owned DUT,
+builder/container, serial, and artifact locks through the local `/v1/locks/...`
+API using the same JSON fields.
+
 ## Persistence
 
 Recommended first version: SQLite.
@@ -449,6 +455,13 @@ Safe LLM tasks:
 - DUT boot failure summary。
 - Drafting troubleshooting notes。
 
+The implemented advisory path is `owrt-monitor analyze <job_id|run_dir>`.
+It reads only persisted job artifacts, redacts common secret-shaped tokens,
+keeps source file hashes and line references, and writes `analysis.json` plus
+`analysis.md` into the run directory. The analysis includes deterministic
+next-action suggestions and a redacted bug report draft. This file is
+structured input for a future LLM/UI layer; it is not an execution authority.
+
 Unsafe LLM tasks unless explicitly approved:
 
 - Choosing firmware file。
@@ -466,13 +479,74 @@ MVP can use direct Python subprocess calls. Long term, Python should call Go dae
 Possible local API:
 
 ```http
+GET  /ui/
 POST /v1/jobs
 GET  /v1/jobs/{id}
+GET  /v1/jobs/{id}/analysis
+GET  /v1/jobs/{id}/runner
+GET  /v1/jobs/{id}/runner-output
 POST /v1/jobs/{id}/cancel
 GET  /v1/jobs/{id}/events
 GET  /v1/locks
-POST /v1/locks/{name}/release
+POST /v1/locks/{dut|builder|serial|artifact}/{name}/acquire
+POST /v1/locks/{dut|builder|serial|artifact}/{name}/heartbeat
+POST /v1/locks/{dut|builder|serial|artifact}/{name}/release
 ```
+
+Current `POST /v1/jobs` bridge:
+
+```json
+{
+  "command": "run",
+  "config": "configs/example.yaml",
+  "profile": "ap",
+  "dry_run": true,
+  "allow_flash": true
+}
+```
+
+Python CLI commands (`build`, `run`, `flash`, `test`, and `dry-run`) can submit
+through this API with `--daemon-url http://127.0.0.1:8765`. Without that flag,
+they keep the direct Python-only fallback path.
+
+Allowed `command` values are `build`, `run`, `flash`, and `test`. For `flash`,
+`artifact` is required, and destructive runs require `allow_flash: true`. owrtd
+generates a `job_<hex>` id, sets `OWRT_MONITOR_JOB_ID` for the Python child
+process, writes human-readable child output to `<run_dir>/runner.log`, writes
+structured stdout/stderr records to `<run_dir>/runner.output.jsonl`, and
+maintains `<run_dir>/runner.json` with the child pid, command, status,
+timestamps, and exit code. While the child is running, owrtd refreshes
+`updated_at` as a heartbeat. `GET /v1/jobs/{id}/runner` returns that runner
+status. If an active runner status points at a dead PID after daemon restart,
+owrtd marks it `orphaned` and persists `orphaned_at`. `GET
+/v1/jobs/{id}/runner-output` streams the structured output as
+`application/x-ndjson`. Add `?tail=N` to return only the last N records, or
+`?follow=true` to keep streaming until the runner exits or the client
+disconnects.
+`--runner-output-rotate-bytes` bounds the active `runner.log` +
+`runner.output.jsonl` segment size (default 16MiB combined), and
+`--runner-output-rotate-files` controls how many rotated segments are kept
+(default 3). Rotation moves both files together through `.1`, `.2`, `.3`, and
+the runner-output API reads rotated segments from oldest to newest before the
+current file. When rotation happens, owrtd sets
+`runner.json.output_rotated=true`.
+`--runner-output-max-bytes` bounds per-job runner output written by owrtd; when
+the limit is reached, owrtd keeps draining stdout/stderr, writes one truncation
+marker, discards later lines, and sets `runner.json.output_truncated`.
+`POST /v1/jobs/{id}/cancel` writes the same cooperative `cancel.flag` marker
+used by the Python CLI and, for owrtd-launched jobs, marks `runner.json` as
+`cancel_requested` with `cancel_requested_at`.
+`GET /v1/locks` returns the lock snapshot from `<artifacts_dir>/locks.json`.
+The Go lock mutation API uses that same snapshot shape and supports
+`dut`, `builder`/`container`, `serial`, and `artifact` locks. Acquire requests
+accept `owner_job_id` plus optional `lock_timeout_sec`; active locks return
+409, stale locks are replaced, heartbeat refreshes `heartbeat_at`, and release
+requires the matching owner.
+`GET /v1/jobs?limit=N` sorts by report `started_at` when present, and falls
+back to `report.json` mtime for older/dry-run reports that do not carry a
+timestamp.
+`GET /ui/` is a read-only dashboard served by owrtd itself. It consumes the
+same local API and intentionally exposes no submit, cancel, or flash buttons.
 
 Event format:
 
@@ -535,4 +609,3 @@ Recommended sequence:
 8. Harden for multiple DUTs and scheduled jobs。
 
 This lets the project become useful early without locking the design too soon.
-

@@ -10,6 +10,8 @@ owrt-monitor status --config configs/example.yaml
 
 Find the failed job's `Run Dir` and read `report.md`. The build-log classifier and provenance
 metadata mean most failures point at their own root cause without needing to grep `build.log`.
+For a redacted advisory bundle with source hashes and evidence line references, run
+`owrt-monitor analyze <job_id> --config configs/example.yaml` and read `analysis.md`.
 
 ```sh
 cat artifacts/<job_id>/report.md
@@ -106,11 +108,15 @@ sudo launchctl list com.apple.tftpd
 # Did the firmware actually publish?
 ls -l /private/tftpboot/
 
-# Permissions readable by tftpd?
+# Permissions writable by the current user and readable by tftpd?
 ls -ld /private/tftpboot/
 ```
 
-The published file should be world-readable. `tftpd` runs as `nobody` by default.
+The workflow must be able to copy the firmware into `upgrade.tftp_root`, and the
+published file should be world-readable. `tftpd` runs as `nobody` by default.
+Run `owrt-monitor lab-check --config configs/example.yaml --profile ap` before
+flashing to catch a missing/non-interactive serial console, unreachable DUT IP,
+or unwritable TFTP root.
 
 ### Refusing to flash without `--allow-flash`
 
@@ -120,17 +126,16 @@ running it against the wrong DUT is hard to recover from. Keep the gate.
 ## Orphan jobs
 
 `owrt-monitor status` shows `Alive: no` for a non-terminal job → the workflow process died
-without persisting a final state. The job's `run_dir` is intact and the DUT lock will
-self-recover after `dut.lock_timeout_sec`. To clean up the DB record manually:
+without persisting a final state. The job's `run_dir` is intact. Mark the job as an orphan
+and release any locks it still owns:
 
 ```sh
-sqlite3 artifacts/owrt_monitor.sqlite3 \
-    "UPDATE jobs SET state='FAILED', result='orphan', \
-                     finished_at=datetime('now') WHERE id='<job_id>'"
+owrt-monitor status --config configs/example.yaml --mark-orphans
 ```
 
-Then `owrt-monitor cancel <job_id>` to write the marker (paranoia — in case the process
-rises from the dead).
+This rewrites `report.json` / `report.md` with state `FAILED`, appends a `job_orphaned`
+event, and clears the job's DUT/builder locks immediately. Without this command, stale locks
+still self-recover after `dut.lock_timeout_sec`.
 
 ## Resuming a partially-completed job
 

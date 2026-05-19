@@ -35,7 +35,7 @@ expensive to skip.
    - Build command
    - Artifact search patterns
    - DUT lock + serial console
-   - Firmware transfer command (`tftp -g -r ...` or `wget -O ...`)
+   - Firmware transfer command (`tftp -g -r ...`, `wget -O ...`, `scp ...`, or custom host command)
    - Upgrade command (`sysupgrade -n /tmp/firmware.bin`)
    - Smoke tests
 
@@ -58,6 +58,12 @@ expensive to skip.
    ls -ld /private/tftpboot
    ```
 
+   **For SCP transfer:** confirm SSH/SCP login works non-interactively. On OpenWrt
+   Dropbear targets without SFTP, add `scp_extra_args: ["-O"]`.
+
+   **For custom transfer:** run the configured command manually once against a harmless
+   file and confirm it writes to `upgrade.remote_path`.
+
 ## Running the real flash
 
 ```sh
@@ -68,14 +74,18 @@ What this does, in order:
 
 1. Acquires the DUT lock (sqlite-backed, with stale-recovery after `dut.lock_timeout_sec`).
 2. Opens the serial console and waits for the prompt.
-3. Publishes the firmware: copies into `tftp_root` for TFTP, or starts a temporary HTTP
-   server for HTTP transfers.
-4. Tells the DUT to fetch the firmware (`tftp -g` or `wget`).
+3. Publishes the firmware: copies into `tftp_root` for TFTP, starts a temporary HTTP
+   server for HTTP transfers, runs `scp`, or runs `custom_transfer_command`.
+4. Tells the DUT to fetch the firmware (`tftp -g` or `wget`), unless SCP/custom host
+   command handles transfer.
 5. Verifies the size, and (if `verify_sha256: true`) the SHA256 hash, on the DUT side.
 6. Runs the configured upgrade command (`sysupgrade -n /tmp/firmware.bin` by default).
 7. Waits for the prompt to return — fails fast on any `boot_failure_patterns` regex.
 8. Runs configured smoke tests.
 9. Releases the DUT lock.
+
+If any configured smoke, custom script, pytest, or SSH test fails, the job is marked
+`FAILED` and the report keeps the failing output section for triage.
 
 ## If you need to abort mid-flash
 

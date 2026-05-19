@@ -71,11 +71,13 @@ in a `prepare-tmpinfo` error.
 # Validate the active profile's config:
 owrt-monitor validate --config configs/example.yaml --profile ap
 
-# Plan everything without side effects (no docker, no DUT touch):
+# Plan everything without side effects (no docker, no DUT serial/network touch):
 owrt-monitor dry-run --config configs/example.yaml --profile ap
 
 # Plan the full flow including DUT actions:
 owrt-monitor run --config configs/example.yaml --profile ap --dry-run --allow-flash
 ```
 
-If the dry-run report.md looks right, swap `--dry-run` for the real run.
+`lab-check` opens the configured serial port briefly, sends a newline, and
+waits for `dut.prompt`. If the dry-run report.md and lab-check look right, swap
+`--dry-run` for the real run.

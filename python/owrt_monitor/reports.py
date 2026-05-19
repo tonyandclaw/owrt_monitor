@@ -26,6 +26,8 @@ class WorkflowReport:
     metrics: dict[str, Any] | None = None
     dut_status: dict[str, Any] | None = None
     script_results: list[dict[str, Any]] = field(default_factory=list)
+    pytest_results: list[dict[str, Any]] = field(default_factory=list)
+    ssh_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -54,6 +56,46 @@ def write_report(report: WorkflowReport) -> None:
         encoding="utf-8",
     )
     (report.run_dir / "report.md").write_text(_markdown_report(data), encoding="utf-8")
+
+
+def mark_report_orphaned(run_dir: Path, *, job_id: str, warning: str) -> None:
+    """Mark an existing or partial report as a failed orphan job."""
+    report_path = run_dir / "report.json"
+    if report_path.exists():
+        try:
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+    else:
+        data = {}
+
+    data["job_id"] = job_id
+    data.setdefault("dry_run", False)
+    data.setdefault("run_dir", str(run_dir))
+    for key in (
+        "actions",
+        "warnings",
+        "test_results",
+        "script_results",
+        "pytest_results",
+        "ssh_results",
+    ):
+        if not isinstance(data.get(key), list):
+            data[key] = []
+
+    data["state"] = "FAILED"
+    data["success"] = False
+    data["run_dir"] = str(run_dir)
+    warnings = data["warnings"]
+    if warning not in warnings:
+        warnings.append(warning)
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "report.md").write_text(_markdown_report(data), encoding="utf-8")
 
 
 def _markdown_report(data: dict[str, Any]) -> str:
@@ -130,7 +172,12 @@ def _markdown_report(data: dict[str, Any]) -> str:
             "build_duration_sec",
             "transfer_duration_sec",
             "boot_duration_sec",
+            "flash_duration_sec",
+            "test_duration_sec",
             "smoke_duration_sec",
+            "script_duration_sec",
+            "pytest_duration_sec",
+            "ssh_duration_sec",
             "total_duration_sec",
         )
         for key in ordered:
@@ -163,18 +210,20 @@ def _markdown_report(data: dict[str, Any]) -> str:
 
     script_results = data.get("script_results") or []
     if script_results:
+        skipped = sum(1 for r in script_results if r.get("skipped"))
         passed = sum(1 for r in script_results if r["passed"])
         total = len(script_results)
-        verdict = "PASS" if passed == total else "FAIL"
+        failed = total - passed - skipped
+        verdict = "PASS" if failed == 0 else "FAIL"
         lines.extend([
             "",
             "## Custom Scripts",
             "",
-            f"- Result: **{verdict}** ({passed}/{total} passed)",
+            f"- Result: **{verdict}** ({passed}/{total} passed, {skipped} skipped)",
             "",
         ])
         for r in script_results:
-            status = "passed" if r["passed"] else "failed"
+            status = "skipped" if r.get("skipped") else ("passed" if r["passed"] else "failed")
             timeout_marker = " (TIMEOUT)" if r.get("timed_out") else ""
             lines.append(
                 f"- `{r['name']}` [{r['path']}] exit={r['exit_code']}: "
@@ -183,23 +232,72 @@ def _markdown_report(data: dict[str, Any]) -> str:
 
     if data["test_results"]:
         results = data["test_results"]
+        skipped = sum(1 for r in results if r.get("skipped"))
         passed = sum(1 for r in results if r["passed"])
         total = len(results)
         total_duration = sum(float(r.get("duration_sec") or 0) for r in results)
-        verdict = "PASS" if passed == total else "FAIL"
+        failed = total - passed - skipped
+        verdict = "PASS" if failed == 0 else "FAIL"
         lines.extend(
             [
                 "",
                 "## Smoke Tests",
                 "",
                 f"- Result: **{verdict}** ({passed}/{total} passed, "
-                f"{total - passed} failed, {total_duration:.1f} s total)",
+                f"{failed} failed, {skipped} skipped, {total_duration:.1f} s total)",
                 "",
             ]
         )
         for result in results:
-            status = "passed" if result["passed"] else "failed"
+            status = (
+                "skipped" if result.get("skipped") else ("passed" if result["passed"] else "failed")
+            )
             duration = result.get("duration_sec") or 0
             lines.append(f"- `{result['command']}`: {status} ({float(duration):.2f} s)")
+
+    pytest_results = data.get("pytest_results") or []
+    if pytest_results:
+        skipped = sum(1 for r in pytest_results if r.get("skipped"))
+        passed = sum(1 for r in pytest_results if r["passed"])
+        total = len(pytest_results)
+        failed = total - passed - skipped
+        verdict = "PASS" if failed == 0 else "FAIL"
+        lines.extend([
+            "",
+            "## Pytest Tests",
+            "",
+            f"- Result: **{verdict}** ({passed}/{total} passed, {skipped} skipped)",
+            "",
+        ])
+        for r in pytest_results:
+            status = "skipped" if r.get("skipped") else ("passed" if r["passed"] else "failed")
+            timeout_marker = " (TIMEOUT)" if r.get("timed_out") else ""
+            lines.append(
+                f"- `{r['name']}` [{r['path']}] exit={r['exit_code']}: "
+                f"{status}{timeout_marker} ({r['duration_sec']:.2f} s)"
+            )
+
+    ssh_results = data.get("ssh_results") or []
+    if ssh_results:
+        skipped = sum(1 for r in ssh_results if r.get("skipped"))
+        passed = sum(1 for r in ssh_results if r["passed"])
+        total = len(ssh_results)
+        failed = total - passed - skipped
+        verdict = "PASS" if failed == 0 else "FAIL"
+        lines.extend([
+            "",
+            "## SSH Tests",
+            "",
+            f"- Result: **{verdict}** ({passed}/{total} passed, {skipped} skipped)",
+            "",
+        ])
+        for r in ssh_results:
+            status = "skipped" if r.get("skipped") else ("passed" if r["passed"] else "failed")
+            timeout_marker = " (TIMEOUT)" if r.get("timed_out") else ""
+            assertion_marker = " (ASSERTION)" if r.get("assertion_failed") else ""
+            lines.append(
+                f"- `{r['name']}` [{r['host']}] exit={r['exit_code']}: "
+                f"{status}{timeout_marker}{assertion_marker} ({r['duration_sec']:.2f} s)"
+            )
 
     return "\n".join(lines) + "\n"

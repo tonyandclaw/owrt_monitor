@@ -1,8 +1,16 @@
 package main
 
-import "fmt"
+import (
+	"net/http"
+	"os"
+	"time"
+)
 
 func main() {
-	fmt.Println("owrtctl is reserved for the Go runner milestone. Use `owrt-monitor` for the MVP.")
+	code := (&cli{
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		client: &http.Client{Timeout: 30 * time.Second},
+	}).run(os.Args[1:])
+	os.Exit(code)
 }
-

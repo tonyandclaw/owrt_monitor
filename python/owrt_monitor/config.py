@@ -3,10 +3,11 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
+from string import Formatter
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ConfigError(ValueError):
@@ -16,6 +17,21 @@ class ConfigError(ValueError):
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 _SENSITIVE_KEY_PATTERN = re.compile(
     r"(password|passwd|secret|token|api[_-]?key|private[_-]?key)", re.I
+)
+_CUSTOM_TRANSFER_PLACEHOLDERS = frozenset(
+    {
+        "artifact",
+        "artifact_path",
+        "filename",
+        "sha256",
+        "size_bytes",
+        "remote_path",
+        "dut_name",
+        "dut_serial",
+        "dut_address",
+        "run_dir",
+        "job_id",
+    }
 )
 
 
@@ -245,6 +261,30 @@ class BootloaderConfig(StrictModel):
         return value
 
 
+class TransferNetworkRecoveryConfig(StrictModel):
+    # Runtime-only rescue for DUT images whose transfer interface is configured
+    # as DHCP but no lease is available yet. The workflow never writes UCI.
+    enabled: bool = False
+    ping_host: str | None = None
+    interface: str | None = None
+    static_cidr: str = "192.168.1.1/24"
+    restore_after_transfer: bool = True
+
+    @field_validator("ping_host", "interface")
+    @classmethod
+    def optional_strings_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("upgrade.network_recovery strings must not be blank")
+        return value
+
+    @field_validator("static_cidr")
+    @classmethod
+    def static_cidr_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("upgrade.network_recovery.static_cidr must not be blank")
+        return value
+
+
 class UpgradeConfig(StrictModel):
     transfer: Literal["http", "scp", "tftp", "bootloader_tftp", "custom"] = "http"
     remote_path: str = "/tmp/firmware.bin"
@@ -256,9 +296,19 @@ class UpgradeConfig(StrictModel):
     http_port: int = 0
     tftp_root: str = "/private/tftpboot"
     tftp_host: str | None = None
+    scp_binary: str = "scp"
+    scp_user: str = "root"
+    scp_host: str | None = None
+    scp_port: int = 22
+    scp_identity_file: Path | None = None
+    scp_extra_args: list[str] = Field(default_factory=list)
+    custom_transfer_command: list[str] = Field(default_factory=list)
     verify_sha256: bool = True
     min_dut_free_kb: int = 0  # 0 disables; set to e.g. 32768 (32 MB) to require headroom
     bootloader: BootloaderConfig = Field(default_factory=BootloaderConfig)
+    network_recovery: TransferNetworkRecoveryConfig = Field(
+        default_factory=TransferNetworkRecoveryConfig
+    )
     # Interactive `[y/N]` prompt right before the destructive command runs.
     # Off by default. When on, reads from stdin via input(); silently skipped
     # if stdin is not a TTY (CI, background scripts), preserving automation.
@@ -292,12 +342,70 @@ class UpgradeConfig(StrictModel):
             raise ValueError("upgrade.http_port must be between 0 and 65535")
         return value
 
+    @field_validator("scp_port")
+    @classmethod
+    def scp_port_must_be_valid(cls, value: int) -> int:
+        if value <= 0 or value > 65535:
+            raise ValueError("upgrade.scp_port must be between 1 and 65535")
+        return value
+
     @field_validator("min_dut_free_kb")
     @classmethod
     def min_dut_free_must_not_be_negative(cls, value: int) -> int:
         if value < 0:
             raise ValueError("upgrade.min_dut_free_kb must be 0 or greater (0 disables)")
         return value
+
+    @field_validator("custom_transfer_command")
+    @classmethod
+    def custom_transfer_command_entries_must_not_be_blank(
+        cls, value: list[str]
+    ) -> list[str]:
+        for entry in value:
+            if not entry.strip():
+                raise ValueError("upgrade.custom_transfer_command entries must not be blank")
+            try:
+                parsed = Formatter().parse(entry)
+                for _, field_name, _, _ in parsed:
+                    if field_name is None:
+                        continue
+                    if field_name not in _CUSTOM_TRANSFER_PLACEHOLDERS:
+                        allowed = ", ".join(sorted(_CUSTOM_TRANSFER_PLACEHOLDERS))
+                        raise ValueError(
+                            "upgrade.custom_transfer_command contains unknown "
+                            f"placeholder {{{field_name}}}; allowed placeholders: {allowed}"
+                        )
+            except ValueError as exc:
+                if "unknown placeholder" in str(exc):
+                    raise
+                raise ValueError(
+                    "upgrade.custom_transfer_command contains invalid placeholder "
+                    f"syntax in {entry!r}: {exc}"
+                ) from exc
+        return value
+
+    @field_validator("scp_binary", "scp_user")
+    @classmethod
+    def scp_strings_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("upgrade.scp_binary and upgrade.scp_user must not be blank")
+        return value
+
+    @field_validator("scp_extra_args")
+    @classmethod
+    def scp_extra_args_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            if not entry.strip():
+                raise ValueError("upgrade.scp_extra_args entries must not be blank")
+        return value
+
+    @model_validator(mode="after")
+    def custom_transfer_requires_command(self) -> UpgradeConfig:
+        if self.transfer == "custom" and not self.custom_transfer_command:
+            raise ValueError(
+                "upgrade.custom_transfer_command is required when upgrade.transfer is custom"
+            )
+        return self
 
     @field_validator("expected_boot_markers")
     @classmethod
@@ -319,6 +427,7 @@ class SmokeTest(StrictModel):
 
     command: str
     expect: str | None = None
+    enabled: bool = True
 
     @field_validator("command")
     @classmethod
@@ -353,6 +462,7 @@ class ScriptTest(StrictModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     timeout_sec: int = 60
+    enabled: bool = True
 
     @field_validator("name", "path")
     @classmethod
@@ -369,9 +479,105 @@ class ScriptTest(StrictModel):
         return value
 
 
+class PytestTest(StrictModel):
+    """A host-side pytest invocation run after serial smoke tests.
+
+    Uses `python -m pytest` by default so it runs in the same interpreter as
+    owrt-monitor. DUT context is exposed through the same `OWRT_*` environment
+    variables as `tests.scripts[]`.
+    """
+
+    name: str
+    path: str
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    timeout_sec: int = 300
+    python: str | None = None
+    enabled: bool = True
+
+    @field_validator("name", "path")
+    @classmethod
+    def must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tests.pytest[].name and .path must not be blank")
+        return value
+
+    @field_validator("python")
+    @classmethod
+    def python_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("tests.pytest[].python must not be blank")
+        return value
+
+    @field_validator("timeout_sec")
+    @classmethod
+    def timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("tests.pytest[].timeout_sec must be positive")
+        return value
+
+
+class SshTest(StrictModel):
+    """One SSH-based post-upgrade test command."""
+
+    name: str
+    command: str
+    expect: str | None = None
+    host: str | None = None
+    user: str = "root"
+    port: int = 22
+    identity_file: Path | None = None
+    ssh_binary: str = "ssh"
+    extra_args: list[str] = Field(default_factory=list)
+    timeout_sec: int = 30
+    enabled: bool = True
+
+    @field_validator("name", "command", "user", "ssh_binary")
+    @classmethod
+    def strings_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tests.ssh[].name, .command, .user, and .ssh_binary must not be blank")
+        return value
+
+    @field_validator("expect")
+    @classmethod
+    def expect_must_compile(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"tests.ssh[].expect is not a valid regex: {exc}") from exc
+        return value
+
+    @field_validator("port")
+    @classmethod
+    def port_must_be_valid(cls, value: int) -> int:
+        if value <= 0 or value > 65535:
+            raise ValueError("tests.ssh[].port must be between 1 and 65535")
+        return value
+
+    @field_validator("extra_args")
+    @classmethod
+    def extra_args_must_not_be_blank(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            if not entry.strip():
+                raise ValueError("tests.ssh[].extra_args entries must not be blank")
+        return value
+
+    @field_validator("timeout_sec")
+    @classmethod
+    def timeout_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("tests.ssh[].timeout_sec must be positive")
+        return value
+
+
 class TestConfig(StrictModel):
     smoke: list[SmokeTest] = Field(default_factory=list)
     scripts: list[ScriptTest] = Field(default_factory=list)
+    pytest: list[PytestTest] = Field(default_factory=list)
+    ssh: list[SshTest] = Field(default_factory=list)
     command_timeout_sec: int = 30
     # Post-boot status snapshot. Empty string disables. Default expects the
     # OpenWrt-shipped `ubus` returning a JSON object with release/kernel/etc.

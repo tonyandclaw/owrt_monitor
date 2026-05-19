@@ -9,7 +9,7 @@ This MVP starts with a safe host-side path, then optionally continues into DUT f
 4. Detect firmware artifacts in the OpenWrt build tree.
 5. Export the selected artifact and write reports.
 6. Optionally serve firmware over a temporary host HTTP server.
-7. Optionally drive the DUT over serial, run the configured upgrade command, and run smoke tests.
+7. Optionally drive the DUT over serial, run the configured upgrade command, and run tests.
 
 ## Install
 
@@ -57,9 +57,20 @@ Dry-run writes a job directory under `artifacts/` with:
 - `report.md`
 
 Plain `dry-run` does not call Docker and does not touch a DUT. `run --dry-run --allow-flash`
-also previews the serial, transfer, upgrade, and smoke-test actions.
+also previews the serial, transfer, upgrade, and test actions.
 
 ## Build and Export Firmware
+
+Before touching hardware, run the local lab readiness check:
+
+```sh
+owrt-monitor lab-check --config configs/example.yaml --profile ap
+OWRT_DUT_SERIAL=/dev/cu.usbserial-8330 owrt-monitor lab-check --config configs/example.yaml --profile ap
+```
+
+It verifies the builder container, serial device selection, DUT network
+reachability, configured firmware transfer path, and that the serial console
+responds with the configured shell prompt before any build or flash work starts.
 
 ```sh
 owrt-monitor build --config configs/example.yaml
@@ -67,6 +78,51 @@ owrt-monitor build --config configs/example.yaml
 
 The configured builder container must be running and must provide `python3` for the MVP artifact
 detector. The detector runs inside the builder workdir and evaluates the configured glob patterns.
+
+To let the Go daemon supervise the workflow process, start `owrtd` and submit
+through the local API:
+
+```sh
+go run ./cmd/owrtd --artifacts-dir artifacts
+owrt-monitor build --config configs/example.yaml --daemon-url http://127.0.0.1:8765
+```
+
+The default path still runs directly in the Python CLI; `--daemon-url` is the
+opt-in Go runner path.
+
+The daemon also serves a read-only dashboard for job history, runner state,
+analysis, and log tails:
+
+```sh
+open http://127.0.0.1:8765/ui/
+```
+
+Use `owrtctl` when the dashboard is too heavy and `curl` is too awkward:
+
+```sh
+go run ./cmd/owrtctl -- health
+go run ./cmd/owrtctl -- build --config configs/example.yaml --profile ap
+go run ./cmd/owrtctl -- run --config configs/example.yaml --profile ap --allow-flash
+go run ./cmd/owrtctl -- flash --config configs/example.yaml --profile ap \
+    --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+go run ./cmd/owrtctl -- test --config configs/example.yaml --profile ap
+go run ./cmd/owrtctl -- dry-run --config configs/example.yaml --profile ap
+go run ./cmd/owrtctl -- jobs --limit 10
+go run ./cmd/owrtctl -- status <job_id>
+go run ./cmd/owrtctl -- wait <job_id>
+go run ./cmd/owrtctl -- logs <job_id> --tail 80 --follow
+go run ./cmd/owrtctl -- report <job_id>
+go run ./cmd/owrtctl -- analysis <job_id>
+go run ./cmd/owrtctl -- events <job_id>
+go run ./cmd/owrtctl -- file <job_id> report.md --output report.md
+go run ./cmd/owrtctl -- cancel <job_id>
+go run ./cmd/owrtctl -- remove <job_id>
+go run ./cmd/owrtctl -- locks
+```
+
+`owrtctl` talks to `http://127.0.0.1:8765` by default. Override that with
+`--daemon-url URL` or `OWRTD_URL`. `wait` exits non-zero if the supervised
+runner exits non-zero, fails to start, becomes orphaned, or times out.
 
 ## Build, Flash, and Test
 
@@ -83,10 +139,11 @@ This command builds and exports firmware first. It then:
 - Verifies size and SHA256 when enabled.
 - Runs the configured upgrade command.
 - Waits for the prompt to return.
-- Runs configured smoke tests.
+- Runs configured smoke, script, pytest, and SSH tests.
 
-Use this only after validating `dut.serial`, `dut.prompt`, `upgrade.http_host`, and
-`upgrade.command` for the specific board.
+Use this only after validating `dut.serial`, `dut.prompt`, the transfer host field
+(`upgrade.http_host`, `upgrade.tftp_host`, or `upgrade.scp_host`), and `upgrade.command`
+for the specific board.
 
 ## Flash Existing Firmware
 
@@ -97,13 +154,14 @@ owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firm
 
 `flash` skips Docker and uses an existing host firmware file.
 
-## Smoke Tests Only
+## Tests Only
 
 ```sh
 owrt-monitor test --config configs/example.yaml
 ```
 
-This opens the DUT serial console, waits for the prompt, and runs `tests.smoke`.
+This opens the DUT serial console, waits for the prompt, runs `tests.smoke`, then runs any
+configured host-side `tests.scripts`, `tests.pytest`, and `tests.ssh` entries.
 
 ## Status
 
@@ -114,6 +172,33 @@ owrt-monitor status --config configs/example.yaml
 Job state is stored in `artifacts/owrt_monitor.sqlite3` unless `project.state_db` is configured.
 The `Alive` column shows `yes`/`no` for non-terminal jobs based on whether the recorded workflow
 PID is still running (orphan jobs from a crash will show `no`).
+
+To mark dead non-terminal jobs as failed orphans and release any locks they still own:
+
+```sh
+owrt-monitor status --config configs/example.yaml --mark-orphans
+```
+
+## Advisory Analysis
+
+Generate a redacted, structured analysis bundle for a completed or failed job:
+
+```sh
+owrt-monitor analyze <job_id> --config configs/example.yaml
+owrt-monitor analyze artifacts/job_x
+```
+
+This writes `analysis.json` and `analysis.md` into the run directory. The output
+is advisory only: it preserves source file hashes, evidence line references,
+suggested next actions, and a redacted bug report draft for a future UI/LLM
+layer, but it never authorizes destructive actions.
+
+When `owrtd` is running, the generated JSON is available through the read-only
+daemon API:
+
+```sh
+curl http://127.0.0.1:8765/v1/jobs/<job_id>/analysis
+```
 
 ## Cancelling and Resuming
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -84,6 +85,7 @@ class SerialSession:
         transcript_path: Path,
         newline: str = "\n",
         transport: SerialTransport | None = None,
+        transport_factory: Callable[[], SerialTransport] | None = None,
         bytesize: int = 8,
         parity: str = "none",
         stopbits: int = 1,
@@ -94,6 +96,7 @@ class SerialSession:
         self.transcript_path = transcript_path
         self.newline = newline
         self._transport = transport
+        self._transport_factory = transport_factory
         self.bytesize = bytesize
         self.parity = parity
         self.stopbits = stopbits
@@ -101,6 +104,12 @@ class SerialSession:
     def connect(self) -> None:
         self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
         if self._transport is not None:
+            return
+        if self._transport_factory is not None:
+            try:
+                self._transport = self._transport_factory()
+            except Exception as exc:
+                raise SerialError(f"cannot open serial port {self.port}: {exc}") from exc
             return
 
         try:
@@ -124,8 +133,10 @@ class SerialSession:
             raise SerialError(f"cannot open serial port {self.port}: {exc}") from exc
 
     def close(self) -> None:
-        if self._transport is not None:
-            self._transport.close()
+        transport = self._transport
+        self._transport = None
+        if transport is not None:
+            transport.close()
 
     def send_newline(self) -> None:
         self._write_text(self.newline)
@@ -217,14 +228,20 @@ class SerialSession:
         timeout_sec: int,
         cancel_token: CancelToken | None = None,
         failure_patterns: list[re.Pattern[str]] | None = None,
+        reconnect_on_error: bool = False,
+        reconnect_interval_sec: float = 1.0,
+        newline_after_reconnect: bool = False,
     ) -> str:
         """Read from the serial transport until `pattern` matches the buffer.
 
         If any regex in `failure_patterns` matches first, a `BootFailureError` is
         raised with the offending line as evidence. This is what makes a flash
         flow surface a kernel panic in seconds instead of timing out.
+
+        When `reconnect_on_error` is true, transient serial I/O errors are
+        treated as USB serial disconnects: the current transport is closed,
+        the port is reopened until the original deadline, and reading resumes.
         """
-        transport = self._require_transport()
         deadline = time.monotonic() + timeout_sec
         chunks: list[str] = []
         failures = failure_patterns or []
@@ -232,8 +249,21 @@ class SerialSession:
         while time.monotonic() < deadline:
             if cancel_token is not None:
                 cancel_token.raise_if_cancelled()
-            waiting = max(int(getattr(transport, "in_waiting", 0)), 1)
-            data = transport.read(waiting)
+            try:
+                transport = self._require_transport()
+                waiting = max(int(getattr(transport, "in_waiting", 0)), 1)
+                data = transport.read(waiting)
+            except OSError as exc:
+                if not reconnect_on_error:
+                    raise
+                self._reconnect_after_io_error(
+                    exc,
+                    deadline=deadline,
+                    cancel_token=cancel_token,
+                    reconnect_interval_sec=reconnect_interval_sec,
+                    newline_after_reconnect=newline_after_reconnect,
+                )
+                continue
             if not data:
                 time.sleep(0.05)
                 continue
@@ -251,6 +281,52 @@ class SerialSession:
                 return output
 
         raise SerialError(f"timed out after {timeout_sec} seconds waiting for {pattern.pattern!r}")
+
+    def _reconnect_after_io_error(
+        self,
+        exc: OSError,
+        *,
+        deadline: float,
+        cancel_token: CancelToken | None,
+        reconnect_interval_sec: float,
+        newline_after_reconnect: bool,
+    ) -> None:
+        self._append_transcript(
+            f"\n[owrt-monitor] serial I/O error: {exc}; reconnecting\n".encode()
+        )
+        self._discard_transport()
+        last_error: Exception = exc
+
+        while time.monotonic() < deadline:
+            if cancel_token is not None:
+                cancel_token.raise_if_cancelled()
+            try:
+                self.connect()
+                if newline_after_reconnect:
+                    self._write_text(self.newline)
+                self._append_transcript(b"[owrt-monitor] serial reconnected\n")
+                return
+            except (OSError, SerialError) as reconnect_exc:
+                last_error = reconnect_exc
+                self._discard_transport()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(max(reconnect_interval_sec, 0.0), remaining))
+
+        raise SerialError(
+            f"serial I/O error and reconnect timed out before prompt returned: {last_error}"
+        ) from exc
+
+    def _discard_transport(self) -> None:
+        transport = self._transport
+        self._transport = None
+        if transport is None:
+            return
+        try:
+            transport.close()
+        except Exception:
+            pass
 
     def _write_text(self, value: str, *, redact_in_transcript: bool = False) -> None:
         transport = self._require_transport()

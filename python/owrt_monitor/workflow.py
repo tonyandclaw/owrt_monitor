@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import uuid
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -173,6 +174,9 @@ class BuildWorkflow:
                 return report
 
             cancel_token.raise_if_cancelled()
+            if allow_flash:
+                dut_workflow.preflight_serial_interactive()
+                cancel_token.raise_if_cancelled()
             docker.preflight()
             cancel_token.raise_if_cancelled()
             self._transition(logger, job_id, JobState.BUILD_RUNNING, "OpenWrt build started")
@@ -199,6 +203,8 @@ class BuildWorkflow:
             metrics: dict[str, float] = {}
             dut_status: dict[str, object] = {}
             script_results: list = []
+            pytest_results: list = []
+            ssh_results: list = []
             if report.build_summary and report.build_summary.get("duration_sec") is not None:
                 metrics["build_duration_sec"] = float(report.build_summary["duration_sec"])
             if allow_flash:
@@ -215,6 +221,8 @@ class BuildWorkflow:
                     metrics=metrics,
                     status_out=dut_status,
                     script_results_out=script_results,
+                    pytest_results_out=pytest_results,
+                    ssh_results_out=ssh_results,
                 )
                 report.test_results = [asdict(result) for result in test_results]
             if metrics:
@@ -223,6 +231,11 @@ class BuildWorkflow:
                 report.dut_status = dict(dut_status)
             if script_results:
                 report.script_results = [asdict(r) for r in script_results]
+            if pytest_results:
+                report.pytest_results = [asdict(r) for r in pytest_results]
+            if ssh_results:
+                report.ssh_results = [asdict(r) for r in ssh_results]
+            _raise_if_post_upgrade_tests_failed(report)
 
             report.state = JobState.SUCCEEDED.value
             report.success = True
@@ -255,7 +268,12 @@ class BuildWorkflow:
             report.state = JobState.FAILED.value
             report.success = False
             report.warnings.append(str(exc))
-            self.store.update_job(job_id=job_id, state=JobState.FAILED.value, result="failed")
+            self.store.update_job(
+                job_id=job_id,
+                state=JobState.FAILED.value,
+                result="failed",
+                metrics=report.metrics,
+            )
             logger.emit(
                 level="ERROR",
                 component="workflow",
@@ -421,6 +439,10 @@ class BuildWorkflow:
 
             self._transition(logger, job_id, JobState.PREFLIGHT, "starting resume preflight")
 
+            if allow_flash:
+                dut_workflow.preflight_serial_interactive()
+                cancel_token.raise_if_cancelled()
+
             if skip_export:
                 exported = existing_artifact
                 assert exported is not None
@@ -439,6 +461,8 @@ class BuildWorkflow:
             resume_metrics: dict[str, float] = {}
             resume_status: dict[str, object] = {}
             resume_scripts: list = []
+            resume_pytest: list = []
+            resume_ssh: list = []
             if allow_flash:
                 _assert_artifact_matches_dut(resumed_config, exported)
                 test_results = dut_workflow.execute_upgrade_and_tests(
@@ -453,6 +477,8 @@ class BuildWorkflow:
                     metrics=resume_metrics,
                     status_out=resume_status,
                     script_results_out=resume_scripts,
+                    pytest_results_out=resume_pytest,
+                    ssh_results_out=resume_ssh,
                 )
                 report.test_results = [asdict(result) for result in test_results]
             if resume_metrics:
@@ -461,6 +487,11 @@ class BuildWorkflow:
                 report.dut_status = dict(resume_status)
             if resume_scripts:
                 report.script_results = [asdict(r) for r in resume_scripts]
+            if resume_pytest:
+                report.pytest_results = [asdict(r) for r in resume_pytest]
+            if resume_ssh:
+                report.ssh_results = [asdict(r) for r in resume_ssh]
+            _raise_if_post_upgrade_tests_failed(report)
 
             report.state = JobState.SUCCEEDED.value
             report.success = True
@@ -492,7 +523,12 @@ class BuildWorkflow:
             report.state = JobState.FAILED.value
             report.success = False
             report.warnings.append(str(exc))
-            self.store.update_job(job_id=job_id, state=JobState.FAILED.value, result="failed")
+            self.store.update_job(
+                job_id=job_id,
+                state=JobState.FAILED.value,
+                result="failed",
+                metrics=report.metrics,
+            )
             logger.emit(
                 level="ERROR",
                 component="workflow",
@@ -665,6 +701,13 @@ def _record_cancellation(
 
 
 def _new_job_id() -> str:
+    configured = os.environ.get("OWRT_MONITOR_JOB_ID")
+    if configured:
+        if len(configured) > 80 or re.search(r"[^A-Za-z0-9_-]", configured):
+            raise WorkflowError(
+                "OWRT_MONITOR_JOB_ID may contain only alphanumerics, underscore, or hyphen"
+            )
+        return configured
     return "job_" + uuid.uuid4().hex[:12]
 
 
@@ -740,6 +783,23 @@ def _assert_artifact_matches_dut(
             f"{pattern!r}. Tighten artifact.patterns or update "
             "dut.expected_artifact_pattern."
         )
+
+
+def _raise_if_post_upgrade_tests_failed(report: WorkflowReport) -> None:
+    failures: list[str] = []
+    for label, results in (
+        ("smoke tests", report.test_results),
+        ("custom scripts", report.script_results),
+        ("pytest tests", report.pytest_results),
+        ("SSH tests", report.ssh_results),
+    ):
+        failed = sum(
+            1 for result in results if not result.get("passed") and not result.get("skipped")
+        )
+        if failed:
+            failures.append(f"{failed}/{len(results)} {label} failed")
+    if failures:
+        raise WorkflowError("post-upgrade tests failed: " + "; ".join(failures))
 
 
 class FlashWorkflow:
@@ -833,9 +893,13 @@ class FlashWorkflow:
             cancel_token.raise_if_cancelled()
             self._transition(logger, job_id, JobState.PREFLIGHT, "starting DUT flash preflight")
             _assert_artifact_matches_dut(self.config, artifact)
+            dut_workflow.preflight_serial_interactive()
+            cancel_token.raise_if_cancelled()
             flash_metrics: dict[str, float] = {}
             flash_status: dict[str, object] = {}
             flash_scripts: list = []
+            flash_pytest: list = []
+            flash_ssh: list = []
             test_results = dut_workflow.execute_upgrade_and_tests(
                 artifact,
                 transition=lambda state, message, fields: self._transition(
@@ -848,6 +912,8 @@ class FlashWorkflow:
                 metrics=flash_metrics,
                 status_out=flash_status,
                 script_results_out=flash_scripts,
+                pytest_results_out=flash_pytest,
+                ssh_results_out=flash_ssh,
             )
             report.test_results = [asdict(result) for result in test_results]
             if flash_metrics:
@@ -856,6 +922,11 @@ class FlashWorkflow:
                 report.dut_status = dict(flash_status)
             if flash_scripts:
                 report.script_results = [asdict(r) for r in flash_scripts]
+            if flash_pytest:
+                report.pytest_results = [asdict(r) for r in flash_pytest]
+            if flash_ssh:
+                report.ssh_results = [asdict(r) for r in flash_ssh]
+            _raise_if_post_upgrade_tests_failed(report)
             report.state = JobState.SUCCEEDED.value
             report.success = True
             self.store.update_job(
@@ -880,7 +951,12 @@ class FlashWorkflow:
             report.state = JobState.FAILED.value
             report.success = False
             report.warnings.append(str(exc))
-            self.store.update_job(job_id=job_id, state=JobState.FAILED.value, result="failed")
+            self.store.update_job(
+                job_id=job_id,
+                state=JobState.FAILED.value,
+                result="failed",
+                metrics=report.metrics,
+            )
             logger.emit(
                 level="ERROR",
                 component="workflow",
@@ -966,12 +1042,41 @@ class SmokeTestWorkflow:
                 ]
             )
             for entry in self.config.tests.smoke:
+                disabled = " (disabled)" if not entry.enabled else ""
                 if entry.expect:
                     report.actions.append(
-                        f"Smoke test: `{entry.command}` (expect /{entry.expect}/)"
+                        f"Smoke test: `{entry.command}` (expect /{entry.expect}/){disabled}"
                     )
                 else:
-                    report.actions.append(f"Smoke test: `{entry.command}`")
+                    report.actions.append(f"Smoke test: `{entry.command}`{disabled}")
+            for entry in self.config.tests.scripts:
+                command = " ".join(shlex.quote(part) for part in [entry.path, *entry.args])
+                disabled = " (disabled)" if not entry.enabled else ""
+                report.actions.append(f"Custom script: `{command}`{disabled}")
+            for entry in self.config.tests.pytest:
+                python = entry.python or sys.executable
+                command = " ".join(
+                    shlex.quote(part) for part in [python, "-m", "pytest", entry.path, *entry.args]
+                )
+                disabled = " (disabled)" if not entry.enabled else ""
+                report.actions.append(f"Pytest: `{command}`{disabled}")
+            for entry in self.config.tests.ssh:
+                host = entry.host or self.config.dut.network.address or "<dut-ip>"
+                command = " ".join(
+                    shlex.quote(part)
+                    for part in [
+                        entry.ssh_binary,
+                        f"{entry.user}@{host}",
+                        entry.command,
+                    ]
+                )
+                disabled = " (disabled)" if not entry.enabled else ""
+                if entry.expect:
+                    report.actions.append(
+                        f"SSH test: `{command}` (expect /{entry.expect}/){disabled}"
+                    )
+                else:
+                    report.actions.append(f"SSH test: `{command}`{disabled}")
 
             if dry_run:
                 report.state = JobState.DRY_RUN.value
@@ -981,7 +1086,7 @@ class SmokeTestWorkflow:
                     level="INFO",
                     component="workflow",
                     event="test_dry_run_completed",
-                    message="planned DUT smoke tests without external side effects",
+                    message="planned DUT tests without external side effects",
                     fields={"run_dir": str(run_dir)},
                 )
                 write_report(report)
@@ -992,8 +1097,14 @@ class SmokeTestWorkflow:
                 logger,
                 job_id,
                 JobState.PREFLIGHT,
-                "starting DUT smoke test preflight",
+                "starting DUT test preflight",
             )
+            dut_workflow.preflight_serial_interactive()
+            cancel_token.raise_if_cancelled()
+            script_results: list = []
+            pytest_results: list = []
+            ssh_results: list = []
+            metrics: dict[str, float] = {}
             test_results = dut_workflow.execute_smoke_tests(
                 transition=lambda state, message, fields: self._transition(
                     logger,
@@ -1002,29 +1113,37 @@ class SmokeTestWorkflow:
                     message,
                     fields=fields,
                 ),
+                script_results_out=script_results,
+                pytest_results_out=pytest_results,
+                ssh_results_out=ssh_results,
+                metrics=metrics,
             )
             report.test_results = [asdict(result) for result in test_results]
-            report.state = (
-                JobState.SUCCEEDED.value
-                if all(result.passed for result in test_results)
-                else JobState.FAILED.value
-            )
-            report.success = all(result.passed for result in test_results)
+            if metrics:
+                report.metrics = dict(metrics)
+            if script_results:
+                report.script_results = [asdict(r) for r in script_results]
+            if pytest_results:
+                report.pytest_results = [asdict(r) for r in pytest_results]
+            if ssh_results:
+                report.ssh_results = [asdict(r) for r in ssh_results]
+            _raise_if_post_upgrade_tests_failed(report)
+            report.state = JobState.SUCCEEDED.value
+            report.success = True
             self.store.update_job(
                 job_id=job_id,
                 state=report.state,
-                result="success" if report.success else "failed",
+                result="success",
+                metrics=report.metrics,
             )
             logger.emit(
-                level="INFO" if report.success else "ERROR",
+                level="INFO",
                 component="workflow",
-                event="smoke_tests_completed",
-                message="DUT smoke tests completed",
+                event="dut_tests_completed",
+                message="DUT tests completed",
                 fields={"run_dir": str(run_dir), "success": report.success},
             )
             write_report(report)
-            if not report.success:
-                raise WorkflowError("one or more smoke tests failed")
             return report
         except JobCancelled as exc:
             _record_cancellation(report, logger, self.store, job_id, run_dir, exc)
@@ -1035,7 +1154,12 @@ class SmokeTestWorkflow:
             if report.state != JobState.FAILED.value:
                 report.state = JobState.FAILED.value
                 report.success = False
-                self.store.update_job(job_id=job_id, state=JobState.FAILED.value, result="failed")
+                self.store.update_job(
+                    job_id=job_id,
+                    state=JobState.FAILED.value,
+                    result="failed",
+                    metrics=report.metrics,
+                )
                 logger.emit(
                     level="ERROR",
                     component="workflow",
