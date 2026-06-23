@@ -29,6 +29,8 @@ from owrt_monitor.storage import JobStore
 from owrt_monitor.transfer import (
     FirmwareServerError,
     TemporaryFirmwareServer,
+    TemporaryTftpFirmwareServer,
+    infer_host_for_interface,
     infer_host_for_target,
 )
 
@@ -44,12 +46,23 @@ _SERIAL_COMMAND_ERROR_PATTERNS = [
         r"permission denied|connection refused|bad address|not found)\b"
     ),
 ]
+_UPGRADE_COMMAND_FAILURE_PATTERNS = [
+    re.compile(r"(?im)^.*\bDevice .+ not supported by this image\b.*$"),
+    re.compile(r"(?im)^.*\bImage check failed\.\s*$"),
+    re.compile(r"(?im)^.*\bImage metadata not found\b.*$"),
+    re.compile(r"(?im)^.*\bInvalid image\b.*$"),
+]
+_HOST_INTERFACE_TRANSFERS = {"http", "tftp", "bootloader_tftp"}
 
 
 @dataclass(frozen=True)
 class _NetworkRecoveryCleanup:
     interface: str
     static_cidr: str
+
+
+def _is_upgrade_command_failure(exc: BootFailureError) -> bool:
+    return any(pattern.pattern == exc.pattern for pattern in _UPGRADE_COMMAND_FAILURE_PATTERNS)
 
 
 def _resolve_serial_path(serial: str | None, patterns: list[str]) -> str:
@@ -344,6 +357,14 @@ class DutWorkflow:
             f"DUT lock: `{self.config.dut.name}`",
             f"Serial console: `{serial}` at `{self.config.dut.baud}` baud",
         ]
+        planned_firmware_host: str | None = None
+
+        def firmware_host() -> str:
+            nonlocal planned_firmware_host
+            if planned_firmware_host is None:
+                planned_firmware_host = self._firmware_host_for_plan()
+            return planned_firmware_host
+
         if self.config.dut.expected_artifact_pattern:
             actions.append(
                 f"Pre-flash gate: artifact filename must match "
@@ -351,24 +372,36 @@ class DutWorkflow:
             )
         recovery = self.config.upgrade.network_recovery
         if recovery.enabled:
-            probe_host = recovery.ping_host or self.config.upgrade.tftp_host or "<firmware-host>"
+            probe_host = recovery.ping_host or firmware_host()
             interface = recovery.interface or self.config.dut.network.interface or "<dut-interface>"
             actions.append(
                 "Transfer network recovery: "
-                f"ping `{probe_host}`; if `{interface}` is DHCP and unreachable, "
-                f"temporarily add `{recovery.static_cidr}`"
+                f"ping `{probe_host}` from the serial console; if unreachable, "
+                f"use `{interface}`/`{recovery.static_cidr}` as recovery hints"
             )
         if self.config.upgrade.transfer == "tftp":
-            host = self.config.upgrade.tftp_host or self.config.upgrade.http_host or "<host-ip>"
+            host = firmware_host()
+            host_action = self._firmware_host_plan_action(host)
+            if host_action is not None:
+                actions.append(host_action)
+            port = (
+                str(self.config.upgrade.tftp_port)
+                if self.config.upgrade.tftp_port
+                else "<auto-port>"
+            )
             actions.append(
                 f"Publish firmware: copy `{filename}` to `{self.config.upgrade.tftp_root}/`"
             )
+            actions.append(f"Start temporary TFTP server: `0.0.0.0:{port}`")
             actions.append(
                 f"Firmware transfer: `tftp -g -r {shlex.quote(filename)} "
-                f"-l {remote_path} {shlex.quote(host)}`"
+                f"-l {remote_path} {shlex.quote(host)} {port}`"
             )
         elif self.config.upgrade.transfer == "bootloader_tftp":
-            host = self.config.upgrade.tftp_host or self.config.upgrade.http_host or "<host-ip>"
+            host = firmware_host()
+            host_action = self._firmware_host_plan_action(host)
+            if host_action is not None:
+                actions.append(host_action)
             bl = self.config.upgrade.bootloader
             actions.append(
                 f"Publish firmware: copy `{filename}` to `{self.config.upgrade.tftp_root}/`"
@@ -394,7 +427,10 @@ class DutWorkflow:
                 f"Firmware transfer: `scp {shlex.quote(filename)} {shlex.quote(target)}`"
             )
         else:
-            host = self.config.upgrade.http_host or "<host-ip>"
+            host = firmware_host()
+            host_action = self._firmware_host_plan_action(host)
+            if host_action is not None:
+                actions.append(host_action)
             url = f"http://{host}:<port>/{filename}"
             actions.append(
                 f"Firmware transfer: `wget -O {remote_path} {shlex.quote(url)}`"
@@ -405,6 +441,16 @@ class DutWorkflow:
             actions.append(
                 "Post-boot gate: boot transcript must contain "
                 + ", ".join(f"/{m}/" for m in self.config.upgrade.expected_boot_markers)
+            )
+        post_network = self.config.upgrade.post_upgrade_network
+        if post_network.ensure_dhcp:
+            interface = (
+                post_network.interface
+                or self.config.dut.network.interface
+                or "<dut-interface>"
+            )
+            actions.append(
+                f"Post-upgrade network: set `{interface}` to DHCP via UCI and reload network"
             )
         for entry in self.config.tests.smoke:
             disabled = " (disabled)" if not entry.enabled else ""
@@ -465,7 +511,7 @@ class DutWorkflow:
         transition(JobState.DUT_LOCKED, "DUT lock acquired", {"dut": self.config.dut.name})
 
         session: SerialSession | None = None
-        server: TemporaryFirmwareServer | None = None
+        server: TemporaryFirmwareServer | TemporaryTftpFirmwareServer | None = None
         network_cleanup: _NetworkRecoveryCleanup | None = None
 
         try:
@@ -538,23 +584,38 @@ class DutWorkflow:
                 elif transfer == "tftp":
                     host = self._firmware_host()
                     published_path = self._publish_to_tftp_root(artifact)
-                    source_descriptor = f"tftp://{host}/{artifact.filename}"
+                    server = TemporaryTftpFirmwareServer(
+                        directory=published_path.parent,
+                        port=self.config.upgrade.tftp_port,
+                    )
+                    server.start()
+                    tftp_port = server.actual_port
+                    source_descriptor = f"tftp://{host}:{tftp_port}/{artifact.filename}"
                     self.logger.emit(
                         level="INFO",
                         component="transfer",
                         event="firmware_published",
-                        message=f"published firmware to {published_path}",
+                        message=(
+                            f"published firmware to {published_path} and started "
+                            f"temporary TFTP server on port {tftp_port}"
+                        ),
                         fields={
                             "tftp_root": self.config.upgrade.tftp_root,
                             "filename": artifact.filename,
                             "size_bytes": artifact.size_bytes,
+                            "tftp_port": tftp_port,
                         },
                     )
                     network_cleanup = self._prepare_transfer_network_recovery(session, host)
                     try:
                         with_retry(
                             "firmware_transfer",
-                            lambda: self._tftp_download_and_verify(session, artifact, host),
+                            lambda: self._tftp_download_and_verify(
+                                session,
+                                artifact,
+                                host,
+                                tftp_port,
+                            ),
                             policy=self.config.retry.firmware_transfer,
                             cancel_token=self.cancel_token,
                             logger=self.logger,
@@ -605,6 +666,7 @@ class DutWorkflow:
                 re.compile(pattern, re.MULTILINE)
                 for pattern in self.config.upgrade.boot_failure_patterns
             ]
+            failure_patterns.extend(_UPGRADE_COMMAND_FAILURE_PATTERNS)
             try:
                 boot_transcript = session.read_until(
                     re.compile(self.config.dut.prompt),
@@ -615,6 +677,18 @@ class DutWorkflow:
                     newline_after_reconnect=True,
                 )
             except BootFailureError as exc:
+                if _is_upgrade_command_failure(exc):
+                    self.logger.emit(
+                        level="ERROR",
+                        component="dut",
+                        event="upgrade_command_failed",
+                        message=str(exc),
+                        fields={"pattern": exc.pattern, "evidence": exc.evidence},
+                    )
+                    raise DutWorkflowError(
+                        f"DUT {self.config.dut.name} failed during firmware upgrade: "
+                        f"{exc.evidence} (matched {exc.pattern!r})"
+                    ) from exc
                 self.logger.emit(
                     level="ERROR",
                     component="dut",
@@ -647,6 +721,7 @@ class DutWorkflow:
                 "DUT prompt returned after upgrade",
                 {"boot_duration_sec": boot_duration_sec},
             )
+            self._ensure_post_upgrade_network_dhcp(session)
 
             if status_out is not None:
                 status = self._capture_dut_status(session)
@@ -785,9 +860,14 @@ class DutWorkflow:
                         cancel_token=self.cancel_token,
                         logger=self.logger,
                     )
+                    # Serial output includes the echoed command line and the
+                    # trailing prompt, so match `expect` per-line (MULTILINE):
+                    # `^`/`$` should anchor to an output line, not the echoed
+                    # command. Without this, e.g. `^\d+\.\d+` against
+                    # `cat /proc/uptime\r\n373659.15 ...` never matches.
                     assertion_failed = (
                         expect is not None
-                        and re.search(expect, result.output) is None
+                        and re.search(expect, result.output, re.MULTILINE) is None
                     )
                     test_result = SmokeTestResult(
                         command=command,
@@ -855,18 +935,21 @@ class DutWorkflow:
             return None
 
         proto = self._network_proto_for_interface(session, interface)
-        if proto != "dhcp":
-            self.logger.emit(
-                level="WARN",
-                component="dut",
-                event="network_recovery_skipped",
-                message=(
-                    f"DUT cannot reach {ping_host}, but {interface} proto is "
-                    f"{proto or 'unknown'}; leaving it unchanged"
-                ),
-                fields={"ping_host": ping_host, "interface": interface, "proto": proto},
-            )
-            return None
+        self.logger.emit(
+            level="INFO",
+            component="dut",
+            event="network_recovery_needed",
+            message=(
+                f"DUT cannot reach {ping_host} from console; applying temporary "
+                f"{recovery.static_cidr} to {interface}"
+            ),
+            fields={
+                "ping_host": ping_host,
+                "interface": interface,
+                "proto": proto,
+                "static_cidr": recovery.static_cidr,
+            },
+        )
 
         cidr = recovery.static_cidr
         quoted_interface = shlex.quote(interface)
@@ -937,7 +1020,8 @@ class DutWorkflow:
             timeout_sec=max(self.config.dut.command_timeout_sec, 5),
             cancel_token=self.cancel_token,
         )
-        match = re.search(r"OWRT_PING_RC=(\d+)", result.output)
+        matches = list(re.finditer(r"OWRT_PING_RC=(\d+)", result.output))
+        match = matches[-1] if matches else None
         return match is not None and match.group(1) == "0"
 
     def _network_proto_for_interface(self, session: SerialSession, interface: str) -> str | None:
@@ -947,7 +1031,9 @@ class DutWorkflow:
             "for s in $(uci -q show network | "
             "sed -n 's/^network\\.\\([^.=]*\\)=interface$/\\1/p'); do "
             "dev=$(uci -q get network.$s.device 2>/dev/null || true); "
-            '[ "$s" = "$iface" ] || [ "$dev" = "$iface" ] || continue; '
+            "ifname=$(uci -q get network.$s.ifname 2>/dev/null || true); "
+            '[ "$s" = "$iface" ] || [ "$dev" = "$iface" ] || '
+            '[ "$ifname" = "$iface" ] || continue; '
             "proto=$(uci -q get network.$s.proto 2>/dev/null || true); break; "
             "done; echo OWRT_PROTO=${proto:-unknown}"
         )
@@ -956,11 +1042,103 @@ class DutWorkflow:
             timeout_sec=self.config.dut.command_timeout_sec,
             cancel_token=self.cancel_token,
         )
-        match = re.search(r"OWRT_PROTO=([^\s\r\n]+)", result.output)
+        matches = list(re.finditer(r"OWRT_PROTO=([^\s\r\n]+)", result.output))
+        match = matches[-1] if matches else None
         if match is None:
             return None
         proto = match.group(1).strip()
         return None if proto == "unknown" else proto
+
+    def _ensure_post_upgrade_network_dhcp(self, session: SerialSession) -> None:
+        post_network = self.config.upgrade.post_upgrade_network
+        if not post_network.ensure_dhcp:
+            return
+
+        interface = post_network.interface or self.config.dut.network.interface
+        if not interface:
+            raise DutWorkflowError(
+                "upgrade.post_upgrade_network.ensure_dhcp is true, but no "
+                "interface was configured"
+            )
+
+        section = self._network_section_for_interface(session, interface)
+        if section is None:
+            raise DutWorkflowError(
+                f"cannot set {interface} to DHCP: no matching UCI network interface section"
+            )
+
+        quoted_section = shlex.quote(section)
+        command = (
+            f"section={quoted_section}; "
+            "uci set network.$section.proto=dhcp; "
+            "for opt in ipaddr netmask gateway broadcast dns ip6assign ip6hint ip6ifaceid; do "
+            "uci -q delete network.$section.$opt; "
+            "done; "
+            "uci commit network; "
+            "/etc/init.d/network reload >/dev/null 2>&1 || "
+            "/etc/init.d/network restart >/dev/null 2>&1 || true; "
+            "sleep 2; "
+            "proto=$(uci -q get network.$section.proto 2>/dev/null || true); "
+            "echo OWRT_POST_UPGRADE_NETWORK=section:$section,proto:${proto:-unknown}"
+        )
+        result = session.run_command(
+            command,
+            timeout_sec=max(self.config.dut.command_timeout_sec, 10),
+            cancel_token=self.cancel_token,
+        )
+        matches = list(
+            re.finditer(
+                r"OWRT_POST_UPGRADE_NETWORK=section:([^,\s]+),proto:([^\s\r\n]+)",
+                result.output,
+            )
+        )
+        match = matches[-1] if matches else None
+        if match is None or match.group(2) != "dhcp":
+            raise DutWorkflowError(
+                f"failed to confirm {interface} is DHCP after upgrade: {result.output.strip()}"
+            )
+
+        self.logger.emit(
+            level="INFO",
+            component="dut",
+            event="post_upgrade_network_dhcp",
+            message=f"set {interface} ({section}) to DHCP after upgrade",
+            fields={"interface": interface, "section": section, "proto": match.group(2)},
+        )
+
+    def _network_section_for_interface(
+        self,
+        session: SerialSession,
+        interface: str,
+    ) -> str | None:
+        quoted_interface = shlex.quote(interface)
+        command = (
+            f"iface={quoted_interface}; section=''; "
+            "for s in $(uci -q show network | "
+            "sed -n 's/^network\\.\\([^.=]*\\)=interface$/\\1/p'); do "
+            "dev=$(uci -q get network.$s.device 2>/dev/null || true); "
+            "ifname=$(uci -q get network.$s.ifname 2>/dev/null || true); "
+            'if [ "$s" = "$iface" ] || [ "$dev" = "$iface" ] || [ "$ifname" = "$iface" ]; then '
+            "section=$s; break; "
+            "fi; "
+            "done; "
+            'if [ -z "$section" ] && [ "$iface" = "br-lan" ] && '
+            "uci -q get network.lan >/dev/null 2>&1; then "
+            "section=lan; "
+            "fi; "
+            "echo OWRT_NETWORK_SECTION=${section:-unknown}"
+        )
+        result = session.run_command(
+            command,
+            timeout_sec=self.config.dut.command_timeout_sec,
+            cancel_token=self.cancel_token,
+        )
+        matches = list(re.finditer(r"OWRT_NETWORK_SECTION=([^\s\r\n]+)", result.output))
+        match = matches[-1] if matches else None
+        if match is None:
+            return None
+        section = match.group(1).strip()
+        return None if section == "unknown" else section
 
     def _http_download_and_verify(
         self,
@@ -984,13 +1162,15 @@ class DutWorkflow:
         session: SerialSession,
         artifact: ExportedArtifact,
         host: str,
+        port: int,
     ) -> None:
         self._check_dut_free_space(session, artifact)
         remote = shlex.quote(self.config.upgrade.remote_path)
         filename = shlex.quote(artifact.filename)
         quoted_host = shlex.quote(host)
+        quoted_port = shlex.quote(str(port))
         result = session.run_command(
-            f"tftp -g -r {filename} -l {remote} {quoted_host}",
+            f"tftp -g -r {filename} -l {remote} {quoted_host} {quoted_port}",
             timeout_sec=self.config.upgrade.transfer_timeout_sec,
             cancel_token=self.cancel_token,
         )
@@ -1514,7 +1694,8 @@ class DutWorkflow:
                 duration = time.monotonic() - started
                 output = (completed.stdout or "") + (completed.stderr or "")
                 assertion_failed = (
-                    entry.expect is not None and re.search(entry.expect, output) is None
+                    entry.expect is not None
+                    and re.search(entry.expect, output, re.MULTILINE) is None
                 )
                 results.append(
                     SshTestResult(
@@ -1858,7 +2039,53 @@ class DutWorkflow:
     def _discover_one_serial_port(self) -> str:
         return _resolve_serial_path(None, self.config.dut.discovery_patterns)
 
+    def firmware_host_plan_action(self) -> str | None:
+        if (
+            self.config.upgrade.transfer not in _HOST_INTERFACE_TRANSFERS
+            or self.config.upgrade.host_interface is None
+        ):
+            return None
+        return self._firmware_host_plan_action(self._firmware_host_for_plan())
+
+    def _firmware_host_plan_action(self, host: str) -> str | None:
+        interface = self.config.upgrade.host_interface
+        if interface is None or self.config.upgrade.transfer not in _HOST_INTERFACE_TRANSFERS:
+            return None
+        return f"Firmware host interface: `{interface}` -> `{host}`"
+
+    def _firmware_host_for_plan(self) -> str:
+        if (
+            self.config.upgrade.transfer in _HOST_INTERFACE_TRANSFERS
+            and self.config.upgrade.host_interface is not None
+        ):
+            return self._firmware_host()
+        if self.config.upgrade.transfer in {"tftp", "bootloader_tftp"}:
+            return self.config.upgrade.tftp_host or self.config.upgrade.http_host or "<host-ip>"
+        return self.config.upgrade.http_host or "<host-ip>"
+
     def _firmware_host(self) -> str:
+        if (
+            self.config.upgrade.transfer in _HOST_INTERFACE_TRANSFERS
+            and self.config.upgrade.host_interface is not None
+        ):
+            interface = self.config.upgrade.host_interface
+            host = infer_host_for_interface(interface)
+            if host is None:
+                raise DutWorkflowError(
+                    f"could not determine an IPv4 address for upgrade.host_interface "
+                    f"{interface!r}; check the USB LAN adapter is connected and has "
+                    "an address, or unset upgrade.host_interface and configure "
+                    "upgrade.tftp_host/upgrade.http_host explicitly"
+                )
+            self.logger.emit(
+                level="INFO",
+                component="transfer",
+                event="firmware_host_resolved",
+                message=f"resolved {interface} to {host}",
+                fields={"host_interface": interface, "host": host},
+            )
+            return host
+
         if self.config.upgrade.transfer in {"tftp", "bootloader_tftp"}:
             configured = self.config.upgrade.tftp_host or self.config.upgrade.http_host
             host_field = "upgrade.tftp_host"

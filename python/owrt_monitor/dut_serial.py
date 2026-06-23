@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import errno
 import glob
+import os
 import re
+import signal
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,6 +70,50 @@ def discover_serial_ports(patterns: list[str]) -> list[str]:
     return sorted(ports)
 
 
+def _is_resource_busy_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "errno", None) == errno.EBUSY:
+            return True
+        message = str(current).lower()
+        if "resource busy" in message or "errno 16" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _find_serial_port_owner_pids(port: str) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["lsof", "-t", port],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise SerialError("lsof is required to clear a busy serial port") from exc
+
+    if result.returncode not in (0, 1):
+        detail = result.stderr.strip() or f"exit status {result.returncode}"
+        raise SerialError(f"lsof failed while checking {port}: {detail}")
+
+    current_pid = os.getpid()
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        try:
+            pid = int(value)
+        except ValueError:
+            continue
+        if pid != current_pid and pid not in pids:
+            pids.append(pid)
+    return pids
+
+
 _PARITY_MAP = {
     "none": "N",
     "even": "E",
@@ -89,6 +137,12 @@ class SerialSession:
         bytesize: int = 8,
         parity: str = "none",
         stopbits: int = 1,
+        recover_busy_port: bool = True,
+        busy_port_term_timeout_sec: float = 2.0,
+        busy_port_kill_timeout_sec: float = 1.0,
+        busy_port_pid_finder: Callable[[str], list[int]] | None = None,
+        busy_port_killer: Callable[[int, int], None] | None = None,
+        busy_port_sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.port = port
         self.baud = baud
@@ -100,18 +154,41 @@ class SerialSession:
         self.bytesize = bytesize
         self.parity = parity
         self.stopbits = stopbits
+        self.recover_busy_port = recover_busy_port
+        self.busy_port_term_timeout_sec = busy_port_term_timeout_sec
+        self.busy_port_kill_timeout_sec = busy_port_kill_timeout_sec
+        self._busy_port_pid_finder = busy_port_pid_finder or _find_serial_port_owner_pids
+        self._busy_port_killer = busy_port_killer or os.kill
+        self._busy_port_sleep = busy_port_sleep
 
     def connect(self) -> None:
         self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
         if self._transport is not None:
             return
-        if self._transport_factory is not None:
-            try:
-                self._transport = self._transport_factory()
-            except Exception as exc:
-                raise SerialError(f"cannot open serial port {self.port}: {exc}") from exc
+        try:
+            self._transport = self._open_transport()
             return
+        except SerialError:
+            raise
+        except Exception as exc:
+            if not self.recover_busy_port or not _is_resource_busy_error(exc):
+                raise SerialError(f"cannot open serial port {self.port}: {exc}") from exc
+            killed_pids = self._clear_busy_port(exc)
 
+        try:
+            self._transport = self._open_transport()
+        except SerialError:
+            raise
+        except Exception as exc:
+            pids = ", ".join(str(pid) for pid in killed_pids)
+            raise SerialError(
+                f"cannot open serial port {self.port} after killing busy owner PID(s) "
+                f"{pids}: {exc}"
+            ) from exc
+
+    def _open_transport(self) -> SerialTransport:
+        if self._transport_factory is not None:
+            return self._transport_factory()
         try:
             import serial
         except ImportError as exc:
@@ -119,18 +196,78 @@ class SerialSession:
                 "pyserial is required for DUT serial support; install owrt-monitor[serial]"
             ) from exc
 
-        try:
-            self._transport = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                bytesize=self.bytesize,
-                parity=_PARITY_MAP.get(self.parity, "N"),
-                stopbits=self.stopbits,
-                timeout=0.2,
-                write_timeout=5,
+        return serial.Serial(
+            port=self.port,
+            baudrate=self.baud,
+            bytesize=self.bytesize,
+            parity=_PARITY_MAP.get(self.parity, "N"),
+            stopbits=self.stopbits,
+            timeout=0.2,
+            write_timeout=5,
+        )
+
+    def _clear_busy_port(self, open_error: BaseException) -> list[int]:
+        pids = self._busy_port_pid_finder(self.port)
+        if not pids:
+            self._append_transcript(
+                (
+                    "\n[owrt-monitor] serial port busy but no owning PID was found "
+                    f"for {self.port}\n"
+                ).encode()
             )
-        except Exception as exc:
-            raise SerialError(f"cannot open serial port {self.port}: {exc}") from exc
+            raise SerialError(
+                f"cannot open serial port {self.port}: {open_error}; "
+                "resource-busy recovery found no owning PID"
+            ) from open_error
+
+        self._append_transcript(
+            (
+                "\n[owrt-monitor] serial port busy; killing owner PID(s) "
+                f"{', '.join(str(pid) for pid in pids)} before retrying\n"
+            ).encode()
+        )
+        remaining = self._signal_busy_port_pids(
+            pids,
+            sig=int(signal.SIGTERM),
+            timeout_sec=max(self.busy_port_term_timeout_sec, 0.0),
+        )
+        if remaining:
+            self._append_transcript(
+                (
+                    "[owrt-monitor] serial port still busy; force killing owner PID(s) "
+                    f"{', '.join(str(pid) for pid in remaining)}\n"
+                ).encode()
+            )
+            self._signal_busy_port_pids(
+                remaining,
+                sig=int(signal.SIGKILL),
+                timeout_sec=max(self.busy_port_kill_timeout_sec, 0.0),
+            )
+        return pids
+
+    def _signal_busy_port_pids(self, pids: list[int], *, sig: int, timeout_sec: float) -> list[int]:
+        targets = set(pids)
+        for pid in sorted(targets):
+            try:
+                self._busy_port_killer(pid, sig)
+            except ProcessLookupError:
+                targets.discard(pid)
+            except PermissionError as exc:
+                raise SerialError(f"permission denied killing PID {pid} for {self.port}") from exc
+            except OSError as exc:
+                raise SerialError(f"failed to kill PID {pid} for {self.port}: {exc}") from exc
+        return self._wait_until_busy_pids_release(targets, timeout_sec=timeout_sec)
+
+    def _wait_until_busy_pids_release(self, pids: set[int], *, timeout_sec: float) -> list[int]:
+        deadline = time.monotonic() + timeout_sec
+        remaining = set(pids)
+        while remaining:
+            current = set(self._busy_port_pid_finder(self.port))
+            remaining &= current
+            if not remaining or time.monotonic() >= deadline:
+                break
+            self._busy_port_sleep(min(0.1, max(deadline - time.monotonic(), 0.0)))
+        return sorted(remaining)
 
     def close(self) -> None:
         transport = self._transport

@@ -140,9 +140,16 @@ func TestBuildCommandSubmitsJob(t *testing.T) {
 func TestSubmitCommandsBuildRequests(t *testing.T) {
 	temp := t.TempDir()
 	configPath := filepath.Join(temp, "config.yaml")
+	defaultConfigPath := filepath.Join(temp, "config", "example.yml")
 	artifactPath := filepath.Join(temp, "firmware.bin")
 	workingDir := filepath.Join(temp, "work")
 	if err := os.WriteFile(configPath, []byte("project: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(defaultConfigPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultConfigPath, []byte("project: {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(artifactPath, []byte("firmware"), 0o644); err != nil {
@@ -151,6 +158,7 @@ func TestSubmitCommandsBuildRequests(t *testing.T) {
 	if err := os.Mkdir(workingDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(temp)
 
 	tests := []struct {
 		name string
@@ -158,14 +166,19 @@ func TestSubmitCommandsBuildRequests(t *testing.T) {
 		want jobSubmitRequest
 	}{
 		{
-			name: "run",
-			args: []string{"run", "--config", configPath, "--profile", "ap", "--allow-flash", "--working-dir", workingDir},
+			name: "run defaults allow flash",
+			args: []string{"run", "--config", configPath, "--profile", "ap", "--working-dir", workingDir},
 			want: jobSubmitRequest{Command: "run", Config: configPath, Profile: "ap", AllowFlash: true, WorkingDir: workingDir},
 		},
 		{
-			name: "flash dry run",
+			name: "build default config",
+			args: []string{"build", "--profile", "ap"},
+			want: jobSubmitRequest{Command: "build", Config: defaultConfigPath, Profile: "ap"},
+		},
+		{
+			name: "flash dry run defaults allow flash",
 			args: []string{"flash", "--config", configPath, "--artifact", artifactPath, "--dry-run"},
-			want: jobSubmitRequest{Command: "flash", Config: configPath, Artifact: artifactPath, DryRun: true},
+			want: jobSubmitRequest{Command: "flash", Config: configPath, Artifact: artifactPath, DryRun: true, AllowFlash: true},
 		},
 		{
 			name: "dry-run alias",
@@ -215,7 +228,7 @@ func TestSubmitCommandsBuildRequests(t *testing.T) {
 	}
 }
 
-func TestFlashCommandRequiresAllowFlashUnlessDryRun(t *testing.T) {
+func TestFlashCommandDefaultsAllowFlash(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	artifactPath := filepath.Join(t.TempDir(), "firmware.bin")
 	if err := os.WriteFile(configPath, []byte("project: {}\n"), 0o644); err != nil {
@@ -224,15 +237,115 @@ func TestFlashCommandRequiresAllowFlashUnlessDryRun(t *testing.T) {
 	if err := os.WriteFile(artifactPath, []byte("firmware"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, stderr, code := runCLI(t, func(http.ResponseWriter, *http.Request) {
-		t.Fatal("server should not be called")
+	stdout, stderr, code := runCLI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/jobs" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		var req jobSubmitRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if req.Command != "flash" || req.Artifact != artifactPath || !req.AllowFlash {
+			t.Fatalf("unexpected request: %#v", req)
+		}
+		writeJSONForTest(t, w, jobSubmitResponse{JobID: "job_flash", Status: "accepted"})
 	}, "flash", "--config", configPath, "--artifact", artifactPath)
+
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stdout, `"job_id": "job_flash"`) {
+		t.Fatalf("stdout missing submit response:\n%s", stdout)
+	}
+}
+
+func TestFlashCommandDefaultsToLatestArtifact(t *testing.T) {
+	temp := t.TempDir()
+	configPath := filepath.Join(temp, "config.yaml")
+	latestArtifact := filepath.Join(temp, "ap.bin")
+	if err := os.WriteFile(configPath, []byte("project: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs":
+			if r.URL.Query().Get("limit") != "100" {
+				t.Fatalf("limit = %s, want 100", r.URL.Query().Get("limit"))
+			}
+			writeJSONForTest(t, w, []jobEntry{
+				{JobID: "job_no_artifact", Success: true},
+				{JobID: "job_controller", Success: true},
+				{JobID: "job_ap", Success: true},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job_no_artifact":
+			writeJSONForTest(t, w, map[string]any{
+				"job_id":         "job_no_artifact",
+				"success":        true,
+				"build_metadata": map[string]any{"profile": "ap"},
+				"artifact":       map[string]any{},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job_controller":
+			writeJSONForTest(t, w, map[string]any{
+				"job_id":         "job_controller",
+				"success":        true,
+				"build_metadata": map[string]any{"profile": "controller"},
+				"artifact":       map[string]any{"host_path": filepath.Join(temp, "controller.bin")},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/jobs/job_ap":
+			writeJSONForTest(t, w, map[string]any{
+				"job_id":         "job_ap",
+				"success":        true,
+				"build_metadata": map[string]any{"profile": "ap"},
+				"artifact":       map[string]any{"host_path": latestArtifact},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/jobs":
+			var req jobSubmitRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			if req.Command != "flash" ||
+				req.Config != configPath ||
+				req.Profile != "ap" ||
+				req.Artifact != latestArtifact ||
+				!req.AllowFlash {
+				t.Fatalf("unexpected request: %#v", req)
+			}
+			writeJSONForTest(t, w, jobSubmitResponse{JobID: "job_flash", Status: "accepted"})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}, "flash", "--config", configPath, "--profile", "ap")
+
+	if code != 0 {
+		t.Fatalf("code = %d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "using latest artifact from job_ap") {
+		t.Fatalf("stderr missing latest artifact note:\n%s", stderr)
+	}
+	if !strings.Contains(stdout, `"job_id": "job_flash"`) {
+		t.Fatalf("stdout missing submit response:\n%s", stdout)
+	}
+}
+
+func TestFlashCommandWithoutArtifactRequiresLatestSuccessfulArtifact(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configPath, []byte("project: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLI(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/jobs" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		writeJSONForTest(t, w, []jobEntry{})
+	}, "flash", "--config", configPath, "--profile", "ap")
 
 	if code == 0 {
 		t.Fatalf("code = 0, want non-zero")
 	}
-	if !strings.Contains(stderr, "flash requires --allow-flash") {
-		t.Fatalf("stderr missing allow-flash guidance:\n%s", stderr)
+	if !strings.Contains(stderr, `no successful job with exported artifact found for profile "ap"`) {
+		t.Fatalf("stderr missing no-latest guidance:\n%s", stderr)
 	}
 }
 
@@ -262,16 +375,16 @@ func TestSubmitCommandRejectsBadArguments(t *testing.T) {
 	if err := os.WriteFile(artifactPath, []byte("firmware"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Chdir(t.TempDir())
 	tests := []struct {
 		name string
 		args []string
 		want string
 	}{
-		{name: "missing config", args: []string{"build"}, want: "--config is required"},
+		{name: "missing config and no default", args: []string{"build"}, want: "--config is required when no default config exists"},
 		{name: "positional", args: []string{"build", "--config", configPath, "extra"}, want: "does not accept positional"},
 		{name: "artifact on build", args: []string{"build", "--config", configPath, "--artifact", artifactPath}, want: "does not accept --artifact"},
 		{name: "test allow flash", args: []string{"test", "--config", configPath, "--allow-flash"}, want: "does not accept --allow-flash"},
-		{name: "flash missing artifact", args: []string{"flash", "--config", configPath, "--allow-flash"}, want: "--artifact is required"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

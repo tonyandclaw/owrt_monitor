@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.owrt-monitor.prune</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tony/.local/bin/owrt-monitor</string>
+        <string>prune</string>
+        <string>--config</string>
+        <string>/Users/tony/play2/owrt_monitor/configs/example.yaml</string>
+        <string>--max-age-days</string>
+        <string>7</string>
+        <string>--apply</string>
+    </array>
+
+    <!-- Run daily at 03:00 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Do not delete on (re)load; only on the daily schedule or manual kickstart. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/tony/Library/Logs/owrt-monitor-prune.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tony/Library/Logs/owrt-monitor-prune.log</string>
+</dict>
+</plist>

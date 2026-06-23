@@ -26,7 +26,7 @@ def test_classify_real_disk_full_log() -> None:
 
     assert summary.success is False
     assert summary.classification == "disk_full"
-    assert summary.failed_target == "owrt2102.asus_mt_wifi7_mt7987"
+    assert summary.failed_target == "owrt2102.asus_eap5000_mt7987"
     # Evidence should include at least one of the canonical disk-full lines.
     assert any("No space left on device" in line for line in summary.evidence)
 
@@ -38,7 +38,7 @@ def test_classify_failed_package_synthetic(tmp_path: Path) -> None:
         "gcc: fatal error: bar.h: No such file or directory\n"
         "make[3]: *** [package/foo/compile] Error 2\n"
         "make[2]: *** [/build/include/toplevel.mk:228: world] Error 2\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
 
@@ -47,14 +47,14 @@ def test_classify_failed_package_synthetic(tmp_path: Path) -> None:
     assert summary.classification == "failed_package"
     assert summary.failed_step == "package/foo/compile"
     assert summary.failed_package == "foo"
-    assert summary.failed_target == "owrt2102.asus_mt_wifi7_mt7987"
+    assert summary.failed_target == "owrt2102.asus_eap5000_mt7987"
 
 
 def test_extract_failed_package_from_nested_path(tmp_path: Path) -> None:
     log = tmp_path / "build.log"
     log.write_text(
         "make[4]: *** [package/feeds/mtk/flowtable/install] Error 2\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
     summary = classify_build_log(log)
@@ -66,7 +66,7 @@ def test_extract_failed_package_for_target_subdir(tmp_path: Path) -> None:
     log = tmp_path / "build.log"
     log.write_text(
         "make[3]: *** [target/linux/install] Error 2\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
     summary = classify_build_log(log)
@@ -79,7 +79,7 @@ def test_failed_package_is_none_for_synthetic_world_target(tmp_path: Path) -> No
     # Only the toplevel/world failure exists; no underlying package fail.
     log.write_text(
         "make[2]: *** [/build/include/toplevel.mk:228: world] Error 2\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
     summary = classify_build_log(log)

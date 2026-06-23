@@ -44,11 +44,11 @@ python3 -m pip install -e ".[dev,serial]"
 
 ```sh
 owrt-monitor validate --config configs/example.yaml
-owrt-monitor lab-check --config configs/example.yaml --profile ap
+owrt-monitor lab-check --config configs/example.yaml
 owrt-monitor dry-run --config configs/example.yaml
 owrt-monitor build --config configs/example.yaml
-owrt-monitor run --config configs/example.yaml --allow-flash
-owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+owrt-monitor run --config configs/example.yaml
+owrt-monitor flash --config configs/example.yaml
 owrt-monitor test --config configs/example.yaml
 owrt-monitor status --config configs/example.yaml
 owrt-monitor analyze <job_id> --config configs/example.yaml
@@ -58,10 +58,9 @@ Go runner/daemon path:
 
 ```sh
 go run ./cmd/owrtd --artifacts-dir artifacts
-go run ./cmd/owrtctl -- build --config configs/example.yaml --profile ap
-go run ./cmd/owrtctl -- run --config configs/example.yaml --profile ap --allow-flash
-go run ./cmd/owrtctl -- flash --config configs/example.yaml --profile ap \
-    --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+go run ./cmd/owrtctl -- build
+go run ./cmd/owrtctl -- run
+go run ./cmd/owrtctl -- flash --profile ap-be5000
 open http://127.0.0.1:8765/ui/
 go run ./cmd/owrtctl -- jobs --limit 10
 go run ./cmd/owrtctl -- wait <job_id>

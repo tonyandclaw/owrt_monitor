@@ -21,11 +21,12 @@ python3 -m pip install -e ".[dev,serial]"
 
 ```sh
 owrt-monitor validate --config configs/example.yaml
-owrt-monitor validate --config configs/example.yaml --profile ap
+owrt-monitor validate --config configs/example.yaml --profile gateway
 ```
 
-`validate` with no `--profile` lists the available profiles defined in the config's
-`profiles:` block (e.g. `ap`, `controller`, `switch`).
+`validate` with no `--profile` applies `project.default_profile` when configured and lists
+the available profiles defined in the config's `profiles:` block (e.g. `ap-be5000`,
+`ap-be14000`, `controller`, `gateway`, `switch`, `ap-mt76`).
 
 ## Profiles
 
@@ -34,9 +35,9 @@ config when selected via `--profile <name>`. Lists (`builder.command`, `artifact
 are replaced wholesale; nested dicts merge key-by-key.
 
 ```sh
-owrt-monitor build --config configs/example.yaml --profile ap
+owrt-monitor build --config configs/example.yaml
 owrt-monitor build --config configs/example.yaml --profile switch
-owrt-monitor flash --config configs/example.yaml --profile controller \
+owrt-monitor flash --config configs/example.yaml --profile gateway \
     --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
 ```
 
@@ -64,8 +65,8 @@ also previews the serial, transfer, upgrade, and test actions.
 Before touching hardware, run the local lab readiness check:
 
 ```sh
-owrt-monitor lab-check --config configs/example.yaml --profile ap
-OWRT_DUT_SERIAL=/dev/cu.usbserial-8330 owrt-monitor lab-check --config configs/example.yaml --profile ap
+owrt-monitor lab-check --config configs/example.yaml
+OWRT_DUT_SERIAL=/dev/cu.usbserial-8330 owrt-monitor lab-check --config configs/example.yaml
 ```
 
 It verifies the builder container, serial device selection, DUT network
@@ -101,12 +102,11 @@ Use `owrtctl` when the dashboard is too heavy and `curl` is too awkward:
 
 ```sh
 go run ./cmd/owrtctl -- health
-go run ./cmd/owrtctl -- build --config configs/example.yaml --profile ap
-go run ./cmd/owrtctl -- run --config configs/example.yaml --profile ap --allow-flash
-go run ./cmd/owrtctl -- flash --config configs/example.yaml --profile ap \
-    --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
-go run ./cmd/owrtctl -- test --config configs/example.yaml --profile ap
-go run ./cmd/owrtctl -- dry-run --config configs/example.yaml --profile ap
+go run ./cmd/owrtctl -- build
+go run ./cmd/owrtctl -- run
+go run ./cmd/owrtctl -- flash --profile ap-be5000
+go run ./cmd/owrtctl -- test
+go run ./cmd/owrtctl -- dry-run
 go run ./cmd/owrtctl -- jobs --limit 10
 go run ./cmd/owrtctl -- status <job_id>
 go run ./cmd/owrtctl -- wait <job_id>
@@ -148,11 +148,13 @@ for the specific board.
 ## Flash Existing Firmware
 
 ```sh
-owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firmware/openwrt.bin --dry-run
-owrt-monitor flash --config configs/example.yaml --artifact artifacts/job_x/firmware/openwrt.bin --allow-flash
+owrt-monitor flash --config configs/example.yaml --dry-run
+owrt-monitor flash --config configs/example.yaml
 ```
 
-`flash` skips Docker and uses an existing host firmware file.
+`flash` skips Docker and uses an existing host firmware file. If `--artifact`
+is omitted, it uses the newest successful exported artifact, filtered by
+`--profile` when provided.
 
 ## Tests Only
 

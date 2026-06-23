@@ -9,6 +9,8 @@ fail loudly at load time.
 - `name`: Human-readable lab or project name.
 - `artifact_dir`: Host directory where job logs, firmware exports, and reports are written.
 - `state_db`: Optional SQLite path. Defaults to `<artifact_dir>/owrt_monitor.sqlite3`.
+- `default_profile`: Optional profile name to apply when a command omits `--profile`.
+  The example config defaults to `ap-be5000`.
 
 ## builder
 
@@ -61,6 +63,11 @@ fail loudly at load time.
 - `min_dut_free_kb`: Minimum free KB at the firmware's remote directory before transfer.
   Default `0` (disabled). Threshold actually applied is `max(min_dut_free_kb, firmware_size_kb)`,
   so even a small explicit setting still guards against an undersized `/tmp`.
+- `host_interface`: Host network interface, macOS network service, or macOS hardware port
+  whose current IPv4 should be used as the firmware host for HTTP/TFTP transfer. Examples:
+  `bridge100`, `en7`, or `USB 10/100/1000 LAN`. When set, this dynamic address takes
+  precedence over `http_host` / `tftp_host`, and `owrt-monitor build` resolves it before
+  the Docker build starts so stale lab IPs fail early.
 - `boot_failure_patterns`: List of regex strings checked against the boot stream during
   reboot wait. Any match raises `BootFailureError` immediately with the offending line as
   evidence, instead of waiting out `boot_timeout_sec`. Default catches Linux kernel panics,
@@ -75,18 +82,30 @@ fail loudly at load time.
 
 ### upgrade — TFTP transfer
 
-- `tftp_root`: Host directory where the workflow `cp`s the firmware so the system tftpd can
-  serve it. Default `/private/tftpboot` (macOS launchd-managed `tftpd`'s default root).
-  Must already exist and be writable; the workflow will not create it.
+- `tftp_root`: Host directory where the workflow `cp`s the firmware before serving it.
+  Default `/private/tftpboot`. Must already exist and be writable; the workflow will not
+  create it. For OpenWrt-shell `transfer: tftp`, `owrt-monitor` serves this directory with
+  a temporary read-only TFTP server.
 - `tftp_host`: Host IP reachable by the DUT for TFTP and `bootloader_tftp`. Falls back
-  to `http_host`, then to inference from `dut.network.address`. The OpenWrt-shell TFTP
-  command shape is `tftp -g -r <filename> -l <remote_path> <tftp_host>` (BusyBox-friendly).
+  to `http_host`, then to inference from `dut.network.address`.
+- `tftp_port`: Host TFTP port for OpenWrt-shell `transfer: tftp`. `0` asks the OS for a
+  free high port and the DUT command uses BusyBox's `HOST PORT` form. `bootloader_tftp`
+  ignores this and still expects the host's normal TFTP service on UDP/69.
+  The OpenWrt-shell TFTP command shape is
+  `tftp -g -r <filename> -l <remote_path> <tftp_host> <tftp_port>`.
 - `network_recovery`: Optional runtime-only rescue before HTTP/TFTP transfer. When
-  `enabled: true`, the workflow pings `ping_host` (or the transfer host). If unreachable
-  and the configured interface is currently `proto dhcp`, it temporarily adds
-  `static_cidr` (for example `192.168.1.1/24`) to `interface`, verifies reachability,
-  transfers the firmware, then removes that temporary IP when `restore_after_transfer`
-  is true. Interfaces configured as static are left unchanged.
+  `enabled: true`, the workflow pings `ping_host` (or the transfer host) from the DUT
+  serial console. If unreachable, it treats `interface` and `static_cidr` (for example
+  `192.168.1.1/24`) as recovery hints, temporarily adds that address to `interface`,
+  verifies reachability, transfers the firmware, then removes the temporary IP when
+  `restore_after_transfer` is true. The UCI proto is logged as context; console
+  reachability is the source of truth.
+- `post_upgrade_network`: Optional persistent post-boot normalization after a successful
+  firmware upgrade. When `ensure_dhcp: true`, the workflow waits for the upgraded image to
+  return to the serial prompt, finds the UCI network section for `interface` (or
+  `dut.network.interface`), sets `proto=dhcp`, deletes common static address fields,
+  commits `network`, reloads/restarts networking, and verifies the section is DHCP before
+  status capture and smoke tests.
 
 ### upgrade — SCP transfer
 
@@ -165,16 +184,17 @@ base config when the user passes `--profile <name>`. List values (e.g. `builder.
 
 ```yaml
 profiles:
-  ap:
+  ap-be5000:
     builder:
-      command: [make, owrt2102.asus_mt_wifi7_mt7987]
+      command: [make, owrt2102.asus_eap5000_mt7987]
     artifact:
       patterns:
-        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin
+        - build/owrt2102/bin/target/openwrt-*-ASUS-EAP5000-squashfs-sysupgrade.bin
     upgrade:
       transfer: tftp
-      tftp_host: 192.168.1.66
+      host_interface: bridge100
 ```
 
 `--profile` is accepted by `validate`, `dry-run`, `build`, `run`, `flash`, `test`, `resume`.
-The applied profile name is captured in the per-job provenance (`build_metadata.profile`).
+If omitted, `project.default_profile` is used when configured. The applied profile name is
+captured in the per-job provenance (`build_metadata.profile`).

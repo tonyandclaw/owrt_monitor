@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -217,6 +219,7 @@ def test_full_flow_with_tftp_transfer(tmp_path: Path) -> None:
     assert b"tftp -g -r" in written
     assert b"-l /tmp/firmware.bin" in written
     assert b"192.0.2.66" in written  # the configured tftp_host (test value)
+    assert re.search(rb"tftp -g -r .* 192\.0\.2\.66 \d+\n", written)
     assert b"wget -O" not in written
 
 
@@ -302,6 +305,54 @@ def test_tftp_transfer_error_fails_before_sysupgrade(tmp_path: Path) -> None:
     assert b"sysupgrade -n" not in written
 
 
+def test_sysupgrade_image_check_failure_fails_before_smoke_tests(tmp_path: Path) -> None:
+    config_path = _write_tftp_config(tmp_path)
+    config = load_config(config_path)
+    fake_docker = FakeDockerBuildClient(builder=config.builder)
+
+    prompt = b"root@OpenWrt:/# "
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"tftp ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            (
+                b"Tue Jun 16 08:55:55 UTC 2026 upgrade: "
+                b"Device mediatek,mt7988a-i2p5g-emmc not supported by this image\n"
+                b"Tue Jun 16 08:55:55 UTC 2026 upgrade: "
+                b"Supported devices: mediatek,mt7988a-ASUS_Controller-emmc\n"
+                b"Image check failed.\n"
+                + prompt
+            ),
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=fake_docker,
+        dut_workflow_kwargs={"serial_session": fake_session},
+    )
+
+    with pytest.raises(WorkflowError, match=r"failed during firmware upgrade.*not supported"):
+        workflow.run(dry_run=False, allow_flash=True)
+
+    written = b"".join(transport.writes)
+    assert b"tftp -g -r" in written
+    assert b"sysupgrade -n" in written
+    assert b"ubus call system board" not in written
+
+    state_db = workflow.config.state_db_path(config_path.resolve())
+    record = JobStore(state_db).recent_jobs(limit=1)[0]
+    assert record["state"] == JobState.FAILED.value
+
+
 def test_tftp_network_recovery_adds_and_removes_temporary_static_ip(tmp_path: Path) -> None:
     config_path = _write_tftp_config(
         tmp_path,
@@ -358,6 +409,129 @@ def test_tftp_network_recovery_adds_and_removes_temporary_static_ip(tmp_path: Pa
     assert written.index(b"ip addr add") < written.index(b"tftp -g -r")
     assert written.index(b"tftp -g -r") < written.index(b"ip addr del")
     assert written.index(b"ip addr del") < written.index(b"sysupgrade -n")
+
+
+def test_tftp_network_recovery_uses_console_state_even_when_uci_static(tmp_path: Path) -> None:
+    config_path = _write_tftp_config(
+        tmp_path,
+        network_recovery={
+            "enabled": True,
+            "ping_host": "192.0.2.66",
+            "interface": "br-lan",
+            "static_cidr": "192.0.2.1/24",
+            "restore_after_transfer": True,
+        },
+    )
+    config = load_config(config_path)
+    fake_docker = FakeDockerBuildClient(builder=config.builder)
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"echo OWRT_PING_RC=$?\nOWRT_PING_RC=1\n" + prompt,
+            b"echo OWRT_PROTO=${proto:-unknown}\nOWRT_PROTO=static\n" + prompt,
+            b"added\n" + prompt,
+            b"echo OWRT_PING_RC=$?\nOWRT_PING_RC=0\n" + prompt,
+            b"tftp ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            b"removed\n" + prompt,
+            b"booted\n" + prompt,
+            status_json + prompt,
+            b"board ok\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=fake_docker,
+        dut_workflow_kwargs={"serial_session": fake_session},
+    )
+
+    report = workflow.run(dry_run=False, allow_flash=True)
+
+    assert report.success is True
+    written = b"".join(transport.writes)
+    assert b"ip addr add 192.0.2.1/24 dev br-lan" in written
+    assert written.index(b"ip addr add") < written.index(b"tftp -g -r")
+
+    events = [
+        json.loads(line)
+        for line in (report.run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    recovery = next(event for event in events if event["event"] == "network_recovery_needed")
+    assert recovery["fields"]["proto"] == "static"
+
+
+def test_tftp_host_interface_feeds_transfer_and_network_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_tftp_config(
+        tmp_path,
+        network_recovery={
+            "enabled": True,
+            "interface": "br-lan",
+            "static_cidr": "192.0.2.1/24",
+            "restore_after_transfer": True,
+        },
+        upgrade_overrides={"host_interface": "USB 10/100/1000 LAN"},
+    )
+    config = load_config(config_path)
+    fake_docker = FakeDockerBuildClient(builder=config.builder)
+
+    monkeypatch.setattr(
+        "owrt_monitor.dut_workflow.infer_host_for_interface",
+        lambda interface: "192.0.2.88",
+    )
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"OWRT_PING_RC=1\n" + prompt,
+            b"OWRT_PROTO=dhcp\n" + prompt,
+            b"added\n" + prompt,
+            b"OWRT_PING_RC=0\n" + prompt,
+            b"tftp ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            b"removed\n" + prompt,
+            b"booted\n" + prompt,
+            status_json + prompt,
+            b"board ok\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=fake_docker,
+        dut_workflow_kwargs={"serial_session": fake_session},
+    )
+
+    report = workflow.run(dry_run=False, allow_flash=True)
+
+    assert report.success is True
+    written = b"".join(transport.writes)
+    assert b"ping -c 1 -W 2 192.0.2.88" in written
+    assert b"tftp -g -r" in written
+    assert b"192.0.2.88" in written
+    assert b"192.0.2.66" not in written
 
 
 def test_full_flow_renders_dut_status_section(tmp_path: Path) -> None:
@@ -476,6 +650,7 @@ def _write_tftp_config(
     tftp_root: str | None = None,
     create_tftp_root: bool = True,
     network_recovery: dict | None = None,
+    upgrade_overrides: dict | None = None,
 ) -> Path:
     if tftp_root is None:
         tftp_root = str(tmp_path / "tftpboot")
@@ -513,6 +688,8 @@ def _write_tftp_config(
     }
     if network_recovery is not None:
         raw["upgrade"]["network_recovery"] = network_recovery
+    if upgrade_overrides is not None:
+        raw["upgrade"].update(upgrade_overrides)
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     return path

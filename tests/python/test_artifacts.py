@@ -40,6 +40,15 @@ def test_fail_if_multiple_artifacts() -> None:
         raise AssertionError("expected ArtifactSelectionError")
 
 
+def test_empty_candidates_reports_no_candidates() -> None:
+    try:
+        select_artifact([], selection="newest", min_size_mb=1)
+    except ArtifactSelectionError as exc:
+        assert "no artifacts matched the configured artifact patterns" in str(exc)
+    else:
+        raise AssertionError("expected ArtifactSelectionError")
+
+
 def test_regex_filter_keeps_matching_only() -> None:
     selected = select_artifact(
         [

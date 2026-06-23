@@ -11,16 +11,64 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 )
 
 func (c *cli) submit(api client, req jobSubmitRequest) error {
+	if req.Command == "flash" && strings.TrimSpace(req.Artifact) == "" {
+		artifact, jobID, err := c.latestArtifact(api, req.Profile)
+		if err != nil {
+			return err
+		}
+		req.Artifact = artifact
+		fmt.Fprintf(c.stderr, "owrtctl: using latest artifact from %s: %s\n", jobID, artifact)
+	}
 	var accepted jobSubmitResponse
 	if err := api.postJSON("/v1/jobs", req, &accepted); err != nil {
 		return err
 	}
 	return printPrettyJSON(c.stdout, accepted)
+}
+
+func (c *cli) latestArtifact(api client, profile string) (artifactPath string, jobID string, err error) {
+	values := url.Values{"limit": {"100"}}
+	var jobs []jobEntry
+	if err := api.getJSON("/v1/jobs", values, &jobs); err != nil {
+		return "", "", fmt.Errorf("find latest artifact: %w", err)
+	}
+	profile = strings.TrimSpace(profile)
+	for _, job := range jobs {
+		if !job.Success {
+			continue
+		}
+		var report jobReport
+		if err := api.getJSON("/v1/jobs/"+url.PathEscape(job.JobID), nil, &report); err != nil {
+			return "", "", fmt.Errorf("read report for %s: %w", job.JobID, err)
+		}
+		if !report.Success {
+			continue
+		}
+		if profile != "" && strings.TrimSpace(report.BuildMetadata.Profile) != profile {
+			continue
+		}
+		artifact := strings.TrimSpace(report.Artifact.HostPath)
+		if artifact == "" {
+			continue
+		}
+		if report.JobID != "" {
+			return artifact, report.JobID, nil
+		}
+		return artifact, job.JobID, nil
+	}
+	if profile != "" {
+		return "", "", fmt.Errorf(
+			"no successful job with exported artifact found for profile %q; pass --artifact explicitly",
+			profile,
+		)
+	}
+	return "", "", errors.New("no successful job with exported artifact found; pass --artifact explicitly")
 }
 
 func (c *cli) health(api client) error {

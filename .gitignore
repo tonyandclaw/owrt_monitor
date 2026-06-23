@@ -13,6 +13,9 @@ build/
 # Go
 bin/
 coverage.out
+# Compiled daemon/CLI binaries built at repo root (go build ./cmd/...)
+/owrtd
+/owrtctl
 
 # Local runtime
 /artifacts/
@@ -27,3 +30,4 @@ coverage.out
 # Editors
 .idea/
 .vscode/
+*.swp

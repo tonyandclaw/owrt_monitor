@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `owrt_monitor` is a Python+Go hybrid that orchestrates OpenWrt builds, firmware export, DUT flashing over USB serial, and post-upgrade smoke tests on a macOS host.
 
-- Python (`python/owrt_monitor/`) is the active control plane and ships the user-facing `owrt-monitor` CLI. Everything in the MVP runs here.
-- Go (`cmd/owrtd`, `cmd/owrtctl`, `internal/`) is reserved for a later runner/daemon milestone. `owrtd` currently exposes only `/healthz` and a `501` stub at `/v1/jobs`; `owrtctl` is a placeholder. `internal/{runner,locks,api,logs}` are empty `.gitkeep` directories. Do not invent runner/daemon features without coordinating with the roadmap in `TODO.md` and `ARCHITECTURE.md`.
+- Python (`python/owrt_monitor/`) is the workflow engine and ships the user-facing `owrt-monitor` CLI. All build/flash/test execution lives here.
+- Go (`cmd/owrtd`, `cmd/owrtctl`) is now a working control plane that wraps the Python engine — not a placeholder. `owrtd` is an HTTP daemon (~16 endpoints: job listing/report/events/files, locks, runner status, and `POST /v1/jobs` which launches `owrt-monitor` as a supervised subprocess). `owrtctl` is its CLI client (~14 commands). Both have substantial test suites; CI enforces a Go coverage minimum (`GO_COVER_MIN`, currently 85%). `internal/{runner,locks,api,logs}` are still empty `.gitkeep` placeholders — all Go code currently lives under `cmd/`. Coordinate new daemon/runner features with the roadmap in `TODO.md` and `ARCHITECTURE.md`.
 - See `ARCHITECTURE.md` for the canonical workflow state machine, language split rationale, locking model, and persistence schema. `TODO.md` is the live roadmap. `docs/quickstart.md` and `docs/config-reference.md` document the CLI and YAML schema.
 
 ## Common commands
@@ -28,17 +28,18 @@ Run a single Python test:
 PYTHONPATH=python python3 -m pytest tests/python/test_workflow.py::test_name
 ```
 
-Go (no tests yet, but CI runs this):
+Go (tested, runs in CI):
 
 ```sh
-go test ./...
+make test-go            # go test ./...
+make test-go-cover      # go test -cover ./... and fail under GO_COVER_MIN (85%)
 go build ./cmd/owrtd ./cmd/owrtctl
 ```
 
-CLI entrypoint after `pip install -e`:
+CLI entrypoint after `pip install -e` (run `owrt-monitor --help` for the full set):
 
 ```sh
-owrt-monitor {validate|dry-run|build|run|flash|test|status} --config configs/example.yaml
+owrt-monitor {validate|lab-check|dry-run|build|run|flash|test|resume|status|inspect|analyze|metrics|prune|cancel} --config configs/example.yaml
 ```
 
 `run --allow-flash` and `flash --allow-flash` execute the destructive `sysupgrade` against the DUT — guard rails refuse to flash unless that flag is explicit, and `dry-run` is the safe preview.
@@ -47,9 +48,11 @@ owrt-monitor {validate|dry-run|build|run|flash|test|status} --config configs/exa
 
 **Three workflow classes, one shared safety contract.** `workflow.py` exposes `BuildWorkflow`, `FlashWorkflow`, and `SmokeTestWorkflow`. Each one creates a fresh `job_<uuid12>` directory under `project.artifact_dir`, snapshots the (redacted) config, opens the SQLite `JobStore`, drives a `JobState` transition stream through `EventLogger` (writes to both `events.jsonl` and the `job_events` table), and calls `write_report` at the end. New workflows must follow this same shape so the `status` command, reports, and recovery story keep working.
 
+**Go owrtd is a thin HTTP face over Python's on-disk state — it does not re-implement the engine.** Per the header comment in `cmd/owrtd/main.go`, the source of truth is the per-job run directories Python writes under `project.artifact_dir` (`report.json`, `events.jsonl`, `analysis.json`). owrtd reads those files to serve `GET` endpoints, and `POST /v1/jobs` launches `owrt-monitor` as a supervised child process (the runner) — Python stays the workflow engine until a later phase migrates execution into Go. SQLite is intentionally *not* opened from Go to avoid a cgo/pure-Go dependency. owrtd binds loopback (127.0.0.1) by default and assumes no TLS; front it with a reverse proxy if exposed. `owrtctl` is just an HTTP client for these endpoints. When adding Go endpoints, keep reads file-based and don't duplicate workflow logic that belongs in Python.
+
 **State transitions persist before side effects.** `_transition` writes to SQLite and emits a JSONL event before any external action (Docker exec, serial write, HTTP serve, `sysupgrade`). Preserve this ordering — it's what makes crash recovery possible per ARCHITECTURE.md.
 
-**DUT logic is centralized in `DutWorkflow`.** Both `BuildWorkflow` (when `--allow-flash`) and `FlashWorkflow` delegate to it for serial connect, HTTP firmware serve (`transfer.py`), `wget` on the DUT, `sysupgrade`, prompt-return wait, and smoke tests. Only `transfer == "http"` is implemented; `scp`/`tftp`/`custom` raise `DutWorkflowError`.
+**DUT logic is centralized in `DutWorkflow`.** Both `BuildWorkflow` (when `--allow-flash`) and `FlashWorkflow` delegate to it for serial connect, firmware transfer (`transfer.py`), the download command on the DUT, `sysupgrade`, prompt-return wait, and smoke tests. Five `upgrade.transfer` modes are implemented (`http`, `tftp`, `bootloader_tftp`, `scp`, `custom`), each with a real-execution branch and a dry-run preview branch in `dut_workflow.py`; an unknown mode raises `DutWorkflowError`. `http`/`tftp`/`bootloader_tftp` serve from the host over the DUT-facing interface, so they go through `infer_host_for_interface` to pick the host IP.
 
 **Config is strict, redacted, and env-interpolated.** `config.py` uses Pydantic with `extra="forbid"`. `${VAR}` and `${VAR:-default}` are expanded from the environment at load time. `OwrtConfig.redacted_dump` masks `dut.login.password` and any `builder.env` key matching the sensitive-key regex — always use the redacted dump for snapshots, reports, and logs.
 
@@ -65,6 +68,6 @@ owrt-monitor {validate|dry-run|build|run|flash|test|status} --config configs/exa
 
 - Python target is 3.11+. Ruff is configured (`E,F,I,UP,B`, line length 100) and runs in CI — keep `make lint` clean.
 - Prefer argument arrays over shell strings for subprocess/Docker calls (see `docker_build.py`). Avoid concatenating user-controlled strings into shells.
-- Don't add new top-level CLI commands without wiring them through a workflow class so jobs/events/reports stay consistent.
+- Commands that *execute* (build/run/flash/test) must go through a workflow class so jobs/events/reports stay consistent. Read-only/reporting commands (`status`, `inspect`, `analyze`, `metrics`, `prune`, `cancel`) instead read the persisted job state (SQLite + on-disk reports) and live in their own modules (`inspect.py`, `analysis.py`, `metrics.py`, `retention.py`, `cancel.py`) — don't make them re-run work.
 - Tests live under `tests/python/`; pytest's `pythonpath` is already set in `pyproject.toml`, so module imports resolve without extra config when invoked via `pytest` directly. The `Makefile` also exports `PYTHONPATH=python` for safety.
 - Integration test harness — `BuildWorkflow` accepts an optional `docker_client=` constructor param. Production builds a real `DockerBuildClient` from config; tests pass `tests/python/fake_docker.py:FakeDockerBuildClient` which fabricates artifacts and writes canned build.log content. End-to-end test coverage for the non-dry-run workflow path lives in `test_workflow_integration.py` — use these as the model when adding new workflow features so the integration surface stays exercised in CI.

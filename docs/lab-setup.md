@@ -11,8 +11,10 @@ talk to a real OpenWrt builder container and a real DUT.
   `DockerBuildClient`'s preflight + artifact detector).
 - Python 3.11+ (`python3 -m pip install -e ".[dev,serial]"`).
 - A USB serial cable to the DUT (e.g. `/dev/cu.usbserial-0001` on macOS).
-- TFTP server rooted at `/private/tftpboot/` if you use `transfer: tftp`. On macOS the
-  built-in launchd-managed `tftpd` is the path of least resistance:
+- A writable TFTP root such as `/private/tftpboot/` if you use `transfer: tftp`.
+  OpenWrt-shell TFTP is served by a temporary `owrt-monitor` process on a high port, so
+  macOS `tftpd` is not required for that path. Bootloader recovery (`bootloader_tftp`)
+  still needs a normal TFTP service on UDP/69:
 
   ```sh
   sudo mkdir -p /private/tftpboot
@@ -41,17 +43,20 @@ The build is `make <profile>` from the firmware root. Known profiles:
 
 | Profile | Board class |
 | --- | --- |
-| `owrt2102.asus_mt_wifi7_mt7987` | AP firmware (WiFi7 / MT7987) |
-| `owrt2102.asus_mt_controller_mt7988` | controller (MT7988) |
+| `owrt2102.asus_eap5000_mt7987` | BE5000 AP (default `ap-be5000`) |
+| `owrt2102.asus_eap14000_mt7987` | BE14000 AP |
+| `owrt2102.asus_controller_mt7988a` | controller (MT7988A) |
+| `owrt2102.asus_gw_mt7988` | gateway (MT7988) |
 | `owrt2410.asus_mt76_mt7987` | AP variant using mt76 driver |
 | `owrt2512.asus_microchipsw` | switch (Microchip) |
 
 ## DUT
 
-For the AP profile in this lab:
+For the default BE5000 AP profile in this lab:
 
 - Reachable serial console (USB-to-UART).
-- Reachable network: DUT's `192.168.1.1` ↔ host's `192.168.1.66` (TFTP path).
+- Reachable network from the DUT to the host interface configured by `upgrade.host_interface`
+  (default `bridge100` for TFTP).
 - `tftp` client present on the OpenWrt shell (BusyBox default — yes).
 - Enough free space in `/tmp` for the firmware (~30 MB for AP).
 
@@ -69,13 +74,13 @@ in a `prepare-tmpinfo` error.
 
 ```sh
 # Validate the active profile's config:
-owrt-monitor validate --config configs/example.yaml --profile ap
+owrt-monitor validate --config configs/example.yaml
 
 # Plan everything without side effects (no docker, no DUT serial/network touch):
-owrt-monitor dry-run --config configs/example.yaml --profile ap
+owrt-monitor dry-run --config configs/example.yaml
 
 # Plan the full flow including DUT actions:
-owrt-monitor run --config configs/example.yaml --profile ap --dry-run --allow-flash
+owrt-monitor run --config configs/example.yaml --dry-run --allow-flash
 ```
 
 `lab-check` opens the configured serial port briefly, sends a newline, and

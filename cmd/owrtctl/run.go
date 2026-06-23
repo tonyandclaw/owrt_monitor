@@ -175,11 +175,11 @@ func daemonURLDefault() string {
 
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `Usage:
-  owrtctl [--daemon-url URL] build --config PATH [--profile NAME] [--dry-run] [--working-dir PATH]
-  owrtctl [--daemon-url URL] run --config PATH [--profile NAME] [--dry-run] [--allow-flash] [--working-dir PATH]
-  owrtctl [--daemon-url URL] flash --config PATH --artifact PATH [--profile NAME] [--dry-run] --allow-flash
-  owrtctl [--daemon-url URL] test --config PATH [--profile NAME] [--dry-run] [--working-dir PATH]
-  owrtctl [--daemon-url URL] dry-run --config PATH [--profile NAME] [--working-dir PATH]
+  owrtctl [--daemon-url URL] build [--config PATH] [--profile NAME] [--dry-run] [--working-dir PATH]
+  owrtctl [--daemon-url URL] run [--config PATH] [--profile NAME] [--dry-run] [--working-dir PATH]
+  owrtctl [--daemon-url URL] flash [--config PATH] [--artifact PATH] [--profile NAME] [--dry-run]
+  owrtctl [--daemon-url URL] test [--config PATH] [--profile NAME] [--dry-run] [--working-dir PATH]
+  owrtctl [--daemon-url URL] dry-run [--config PATH] [--profile NAME] [--working-dir PATH]
   owrtctl [--daemon-url URL] health
   owrtctl [--daemon-url URL] jobs [--limit N]
   owrtctl [--daemon-url URL] status <job_id>
@@ -194,7 +194,13 @@ func printUsage(w io.Writer) {
   owrtctl [--daemon-url URL] locks
 
 Environment:
-  OWRTD_URL sets the default daemon URL when --daemon-url is omitted.`)
+  OWRTD_URL sets the default daemon URL when --daemon-url is omitted.
+
+Notes:
+  --config defaults to config/example.yml, config/example.yaml, configs/example.yaml, or configs/example.yml.
+  run and flash submit with allow_flash enabled by default; use --dry-run to avoid destructive work.
+  flash without --artifact uses the newest successful job with an exported artifact.
+  When --profile is set, the default artifact must come from the same profile.`)
 }
 
 func oneJobID(args []string) (string, error) {

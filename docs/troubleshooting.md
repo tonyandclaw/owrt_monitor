@@ -97,6 +97,13 @@ A prior job crashed while holding the DUT lock. If `dut.lock_timeout_sec` (defau
 hasn't elapsed, wait or bump it; otherwise the lock will be auto-broken on next acquire.
 Stale locks from killed processes self-recover on the next attempt.
 
+### `Resource busy: '/dev/cu.usbserial-...'`
+
+When opening the DUT serial port returns `Errno 16` / `Resource busy`, the workflow runs
+`lsof -t <serial>` to find the process holding that exact device, sends `SIGTERM`, then
+falls back to `SIGKILL` if the port is still held. It then retries the serial open once.
+Check `serial.log` for the killed PID list if the retry still fails.
+
 ### `tftp` command on the DUT exits non-zero
 
 Check from the host:
@@ -114,7 +121,7 @@ ls -ld /private/tftpboot/
 
 The workflow must be able to copy the firmware into `upgrade.tftp_root`, and the
 published file should be world-readable. `tftpd` runs as `nobody` by default.
-Run `owrt-monitor lab-check --config configs/example.yaml --profile ap` before
+Run `owrt-monitor lab-check --config configs/example.yaml` before
 flashing to catch a missing/non-interactive serial console, unreachable DUT IP,
 or unwritable TFTP root.
 

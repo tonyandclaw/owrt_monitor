@@ -95,6 +95,29 @@ def test_smoke_fails_when_expect_does_not_match(tmp_path: Path) -> None:
     assert "DOWN" in r.output
 
 
+def test_smoke_anchored_expect_matches_after_echoed_command(tmp_path: Path) -> None:
+    # Real serial output echoes the typed command on its own line before the
+    # command's actual output, so a `^`-anchored regex must anchor per-line
+    # (MULTILINE) rather than to the echoed command. Regression for the
+    # `cat /proc/uptime` with `expect: ^\d+\.\d+` false-negative.
+    workflow, session, transport = _make_workflow_with_serial(
+        tmp_path,
+        smoke=[{"command": "cat /proc/uptime", "expect": r"^\d+\.\d+"}],
+        chunks=[
+            b"root@OpenWrt:/# ",
+            b"cat /proc/uptime\r\n373659.15 1491744.51\r\nroot@OpenWrt:/# ",
+        ],
+    )
+    session.connect()
+    session.send_newline()
+    session.read_until_prompt(timeout_sec=1)
+    results = workflow.run_smoke_tests(session)
+    r = results[0]
+    assert r.passed is True
+    assert r.assertion_failed is False
+    assert r.assertion == r"^\d+\.\d+"
+
+
 def test_smoke_entry_can_be_skipped(tmp_path: Path) -> None:
     workflow, session, transport = _make_workflow_with_serial(
         tmp_path,

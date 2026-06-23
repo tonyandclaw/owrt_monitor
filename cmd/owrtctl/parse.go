@@ -21,7 +21,11 @@ func parseSubmitRequest(
 	config := fs.String("config", "", "owrt_monitor config path")
 	profile := fs.String("profile", "", "config profile")
 	dryRun := fs.Bool("dry-run", command == "dry-run", "submit as dry-run")
-	allowFlash := fs.Bool("allow-flash", false, "permit destructive flash/run")
+	allowFlash := fs.Bool(
+		"allow-flash",
+		command == "run" || command == "flash",
+		"permit destructive flash/run; default true for run and flash",
+	)
 	artifact := fs.String("artifact", "", "firmware artifact path for flash")
 	workingDir := fs.String("working-dir", "", "working directory for owrtd-launched process")
 	if err := fs.Parse(args); err != nil {
@@ -36,10 +40,15 @@ func parseSubmitRequest(
 		submitCommand = "build"
 		*dryRun = true
 	}
-	if strings.TrimSpace(*config) == "" {
-		return jobSubmitRequest{}, errors.New("--config is required")
+	configPath := strings.TrimSpace(*config)
+	if configPath == "" {
+		var defaultErr error
+		configPath, defaultErr = defaultConfigPath()
+		if defaultErr != nil {
+			return jobSubmitRequest{}, defaultErr
+		}
 	}
-	absConfig, err := filepath.Abs(*config)
+	absConfig, err := filepath.Abs(configPath)
 	if err != nil {
 		return jobSubmitRequest{}, fmt.Errorf("resolve --config: %w", err)
 	}
@@ -70,14 +79,13 @@ func parseSubmitRequest(
 		req.Profile = *profile
 	}
 	if submitCommand == "flash" {
-		if strings.TrimSpace(*artifact) == "" {
-			return jobSubmitRequest{}, errors.New("--artifact is required for flash")
+		if strings.TrimSpace(*artifact) != "" {
+			absArtifact, err := filepath.Abs(*artifact)
+			if err != nil {
+				return jobSubmitRequest{}, fmt.Errorf("resolve --artifact: %w", err)
+			}
+			req.Artifact = absArtifact
 		}
-		absArtifact, err := filepath.Abs(*artifact)
-		if err != nil {
-			return jobSubmitRequest{}, fmt.Errorf("resolve --artifact: %w", err)
-		}
-		req.Artifact = absArtifact
 		if !req.DryRun && !req.AllowFlash {
 			return jobSubmitRequest{}, errors.New("flash requires --allow-flash unless --dry-run is set")
 		}
@@ -85,6 +93,31 @@ func parseSubmitRequest(
 		return jobSubmitRequest{}, fmt.Errorf("%s does not accept --artifact", command)
 	}
 	return req, nil
+}
+
+func defaultConfigPath() (string, error) {
+	candidates := []string{
+		"config/example.yml",
+		"config/example.yaml",
+		"configs/example.yaml",
+		"configs/example.yml",
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil {
+			if info.IsDir() {
+				continue
+			}
+			return candidate, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("check default config %s: %w", candidate, err)
+		}
+	}
+	return "", fmt.Errorf(
+		"--config is required when no default config exists; tried %s",
+		strings.Join(candidates, ", "),
+	)
 }
 
 func parseLogsArgs(args []string, daemonURL *string) (

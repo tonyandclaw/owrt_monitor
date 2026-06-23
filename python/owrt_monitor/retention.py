@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,24 +36,58 @@ def plan_prune(
     keep_success: int = 10,
     keep_failed: int = 5,
     keep_other: int = 5,
+    max_age_days: int | None = None,
+    now: datetime | None = None,
     artifact_root: Path | None = None,
     limit: int = 1000,
 ) -> PrunePlan:
-    """Decide which run_dirs to remove based on the keep counts.
+    """Decide which run_dirs to remove.
 
-    For each result bucket (success / failed / other), keep the newest N jobs
-    by `started_at`; everything older becomes a target. `artifact_root` is
-    optional — when set, only jobs whose `artifact_dir` is inside it are
-    considered (defends against pruning unrelated jobs from a shared DB).
+    Two mutually-exclusive modes:
+
+    * **Age-based** (when `max_age_days` is set): every job whose `started_at`
+      is older than `max_age_days` becomes a target, regardless of result or
+      the keep counts. Jobs with an unparseable `started_at` are kept (we never
+      delete something of unknown age). `now` is injectable for testing.
+    * **Count-based** (default): for each result bucket (success / failed /
+      other), keep the newest N jobs by `started_at`; everything older becomes a
+      target.
+
+    `artifact_root` is optional — when set, only jobs whose `artifact_dir` is
+    inside it are considered (defends against pruning unrelated jobs from a
+    shared DB).
     """
     rows = store.recent_jobs(limit=limit)
-    by_result: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        if artifact_root is not None:
+    if artifact_root is not None:
+        root = artifact_root.resolve()
+        scoped: list[dict[str, Any]] = []
+        for row in rows:
             try:
-                Path(row["artifact_dir"]).resolve().relative_to(artifact_root.resolve())
+                Path(row["artifact_dir"]).resolve().relative_to(root)
             except (ValueError, OSError):
                 continue
+            scoped.append(row)
+        rows = scoped
+
+    if max_age_days is not None:
+        return _plan_by_age(rows, max_age_days=max_age_days, now=now)
+    return _plan_by_count(
+        rows,
+        keep_success=keep_success,
+        keep_failed=keep_failed,
+        keep_other=keep_other,
+    )
+
+
+def _plan_by_count(
+    rows: list[dict[str, Any]],
+    *,
+    keep_success: int,
+    keep_failed: int,
+    keep_other: int,
+) -> PrunePlan:
+    by_result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
         result = row.get("result") or "in_progress"
         by_result[result].append(row)
 
@@ -65,25 +100,72 @@ def plan_prune(
         keep = keep_table.get(result, keep_other)
         kept_counts[result] = min(keep, len(entries))
         for row in entries[keep:]:
-            run_dir = Path(row["artifact_dir"])
-            if not run_dir.is_dir():
+            target = _make_target(row, result)
+            if target is None:
                 continue
-            size = _dir_size(run_dir)
-            targets.append(
-                PruneTarget(
-                    job_id=row["id"],
-                    result=result,
-                    started_at=row["started_at"],
-                    run_dir=run_dir,
-                    size_bytes=size,
-                )
-            )
-            total_bytes += size
+            targets.append(target)
+            total_bytes += target.size_bytes
     targets.sort(key=lambda t: t.started_at)  # oldest first → readable output
     return PrunePlan(
         targets=targets,
         total_bytes=total_bytes,
         kept_count_by_result=dict(kept_counts),
+    )
+
+
+def _plan_by_age(
+    rows: list[dict[str, Any]],
+    *,
+    max_age_days: int,
+    now: datetime | None,
+) -> PrunePlan:
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=max_age_days)
+    targets: list[PruneTarget] = []
+    kept_counts: dict[str, int] = defaultdict(int)
+    total_bytes = 0
+    for row in rows:
+        result = row.get("result") or "in_progress"
+        started = _parse_started_at(row.get("started_at"))
+        # Safety: keep anything newer than the cutoff, and keep anything whose
+        # timestamp we cannot parse rather than risk deleting it.
+        if started is None or started >= cutoff:
+            kept_counts[result] += 1
+            continue
+        target = _make_target(row, result)
+        if target is None:
+            continue
+        targets.append(target)
+        total_bytes += target.size_bytes
+    targets.sort(key=lambda t: t.started_at)  # oldest first → readable output
+    return PrunePlan(
+        targets=targets,
+        total_bytes=total_bytes,
+        kept_count_by_result=dict(kept_counts),
+    )
+
+
+def _parse_started_at(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _make_target(row: dict[str, Any], result: str) -> PruneTarget | None:
+    run_dir = Path(row["artifact_dir"])
+    if not run_dir.is_dir():
+        return None
+    return PruneTarget(
+        job_id=row["id"],
+        result=result,
+        started_at=row["started_at"],
+        run_dir=run_dir,
+        size_bytes=_dir_size(run_dir),
     )
 
 

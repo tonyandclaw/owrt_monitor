@@ -20,7 +20,7 @@ def test_analyze_run_dir_redacts_and_preserves_source_refs(tmp_path: Path) -> No
     (run_dir / "build.log").write_text(
         "make package/foo\n"
         "make[3]: *** [package/foo/compile] Error 2\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
     (run_dir / "runner.output.jsonl").write_text(
@@ -63,15 +63,15 @@ def test_analyze_run_dir_includes_bug_report_draft(tmp_path: Path) -> None:
             "sha256": "abc",
         },
         "build_metadata": {
-            "profile": "ap",
-            "make_target": "owrt2102.asus_mt_wifi7_mt7987",
+            "profile": "ap-be5000",
+            "make_target": "owrt2102.asus_eap5000_mt7987",
             "git_describe": "test-dirty",
         },
     }
     (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
     (run_dir / "build.log").write_text(
         "No space left on device\n"
-        "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2\n",
+        "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2\n",
         encoding="utf-8",
     )
 

@@ -65,7 +65,7 @@ When opening a new slice, check this bucket first — most "open" items are deli
   - [x] test commands。
 - [x] 實作 config validation。
 - [x] 支援多 profile（`profiles:` block + `--profile <name>` CLI flag，deep-merge overlay 到 base config）：
-  - [x] board profile（已落地：ap / controller / switch / ap-mt76 在 `configs/example.yaml`）。
+  - [x] board profile（已落地：ap-be5000 / ap-be14000 / controller / gateway / switch / ap-mt76 在 `configs/example.yaml`）。
   - [x] target profile（同 board，因為 builder.command + artifact.patterns 一併蓋）。
   - [x] DUT profile（profile 可以蓋 `dut:` block 任何欄位，例如同台機器多個序列埠）。
   - [x] test profile（profile 可蓋 `tests.smoke` list）。
@@ -213,7 +213,7 @@ When opening a new slice, check this bucket first — most "open" items are deli
   - [x] network interface up（`command: ip -j addr ...` + `expect: '"operstate":"UP"'`）。
   - [x] expected packages（`command: opkg list-installed` + `expect: <package-name>`）。
   - [x] expected services（`command: /etc/init.d/<svc> status` + `expect: running`）。
-- [x] 支援 board-specific tests（profile overlay 可蓋 `tests.smoke`、`tests.status_command`、整個 `dut.*` block；configs/example.yaml 的 `ap` / `controller` / `switch` 各自有不同的 smoke 列表能力）。
+- [x] 支援 board-specific tests（profile overlay 可蓋 `tests.smoke`、`tests.status_command`、整個 `dut.*` block；configs/example.yaml 的 `ap-be5000` / `controller` / `gateway` / `switch` 各自有不同的 smoke 列表能力）。
 - [x] 支援 test result report：
   - [x] passed/failed/skipped（每個 smoke/script/pytest/SSH entry 支援 `enabled: false`，report.md 聚合 passed/failed/skipped；skipped 不會讓 job failed）。
   - [x] duration（每行 smoke test 後加 `(0.12 s)`，並有 total 行）。

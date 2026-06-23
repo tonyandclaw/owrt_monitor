@@ -1,4 +1,6 @@
+import errno
 import re
+import signal
 from pathlib import Path
 
 import pytest
@@ -134,6 +136,109 @@ def test_read_until_can_reconnect_after_serial_io_error(tmp_path: Path) -> None:
     transcript_text = transcript.read_text(encoding="utf-8")
     assert "serial I/O error" in transcript_text
     assert "serial reconnected" in transcript_text
+
+
+def test_connect_kills_busy_serial_owner_and_retries(tmp_path: Path) -> None:
+    transport = FakeTransport([])
+    attempts = 0
+
+    def factory() -> FakeTransport:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EBUSY, "Resource busy")
+        return transport
+
+    finder_calls: list[str] = []
+
+    def pid_finder(port: str) -> list[int]:
+        finder_calls.append(port)
+        if len(finder_calls) == 1:
+            return [4321]
+        return []
+
+    killed: list[tuple[int, int]] = []
+    session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=r"root@OpenWrt:.*# ",
+        transcript_path=tmp_path / "serial.log",
+        transport_factory=factory,
+        busy_port_term_timeout_sec=0,
+        busy_port_kill_timeout_sec=0,
+        busy_port_pid_finder=pid_finder,
+        busy_port_killer=lambda pid, sig: killed.append((pid, sig)),
+        busy_port_sleep=lambda _seconds: None,
+    )
+
+    session.connect()
+
+    assert attempts == 2
+    assert killed == [(4321, int(signal.SIGTERM))]
+    transcript = (tmp_path / "serial.log").read_text(encoding="utf-8")
+    assert "serial port busy; killing owner PID(s) 4321" in transcript
+
+
+def test_connect_force_kills_serial_owner_if_term_does_not_release(
+    tmp_path: Path,
+) -> None:
+    transport = FakeTransport([])
+    attempts = 0
+
+    def factory() -> FakeTransport:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError(errno.EBUSY, "Resource busy")
+        return transport
+
+    finder_results = [[4321], [4321], []]
+
+    def pid_finder(_port: str) -> list[int]:
+        if finder_results:
+            return finder_results.pop(0)
+        return []
+
+    killed: list[tuple[int, int]] = []
+    session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=r"root@OpenWrt:.*# ",
+        transcript_path=tmp_path / "serial.log",
+        transport_factory=factory,
+        busy_port_term_timeout_sec=0,
+        busy_port_kill_timeout_sec=0,
+        busy_port_pid_finder=pid_finder,
+        busy_port_killer=lambda pid, sig: killed.append((pid, sig)),
+        busy_port_sleep=lambda _seconds: None,
+    )
+
+    session.connect()
+
+    assert attempts == 2
+    assert killed == [(4321, int(signal.SIGTERM)), (4321, int(signal.SIGKILL))]
+
+
+def test_connect_does_not_kill_owner_for_non_busy_open_error(tmp_path: Path) -> None:
+    killed: list[tuple[int, int]] = []
+
+    def factory() -> FakeTransport:
+        raise OSError("permission denied")
+
+    session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=r"root@OpenWrt:.*# ",
+        transcript_path=tmp_path / "serial.log",
+        transport_factory=factory,
+        busy_port_pid_finder=lambda _port: [4321],
+        busy_port_killer=lambda pid, sig: killed.append((pid, sig)),
+    )
+
+    with pytest.raises(SerialError, match=r"cannot open serial port /dev/fake"):
+        session.connect()
+
+    assert killed == []
 
 
 def test_probe_serial_interactive_sends_newline_and_matches_prompt(tmp_path: Path) -> None:

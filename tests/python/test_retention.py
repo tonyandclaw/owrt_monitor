@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from owrt_monitor.retention import apply_prune, format_bytes, plan_prune
+from owrt_monitor.retention import (
+    _parse_started_at,
+    apply_prune,
+    format_bytes,
+    plan_prune,
+)
 from owrt_monitor.state import JobState
 from owrt_monitor.storage import JobStore
 
@@ -118,6 +124,54 @@ def test_apply_prune_deletes_run_dirs_and_reports_bytes(tmp_path: Path) -> None:
     assert freed == plan.total_bytes
     assert not (artifact_root / "old").exists()
     assert (artifact_root / "new").exists()
+
+
+def test_plan_prune_age_based_deletes_jobs_older_than_cutoff(tmp_path: Path) -> None:
+    """Age mode deletes every job older than the cutoff, ignoring keep counts."""
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    store = JobStore(tmp_path / "state.sqlite3")
+    for i in range(3):
+        _seed_job(store, artifact_root, job_id=f"s{i}", result="success")
+
+    # now = 8 days after the jobs were created → cutoff (now - 7d) is in their
+    # future, so all are "older than 7 days" even with a generous keep_success.
+    future = datetime.now(UTC) + timedelta(days=8)
+    plan = plan_prune(
+        store,
+        max_age_days=7,
+        now=future,
+        keep_success=100,
+        artifact_root=artifact_root,
+    )
+    assert {t.job_id for t in plan.targets} == {"s0", "s1", "s2"}
+
+
+def test_plan_prune_age_based_keeps_recent_jobs(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    store = JobStore(tmp_path / "state.sqlite3")
+    _seed_job(store, artifact_root, job_id="s0", result="success")
+
+    plan = plan_prune(
+        store,
+        max_age_days=7,
+        now=datetime.now(UTC),
+        artifact_root=artifact_root,
+    )
+    assert plan.targets == []
+    assert plan.kept_count_by_result.get("success") == 1
+
+
+def test_parse_started_at_handles_bad_and_naive_values() -> None:
+    assert _parse_started_at(None) is None
+    assert _parse_started_at("") is None
+    assert _parse_started_at("not-a-date") is None
+    aware = _parse_started_at("2026-06-23T02:04:47.286219+00:00")
+    assert aware is not None and aware.tzinfo is not None
+    # naive timestamps are assumed UTC so comparisons never raise.
+    naive = _parse_started_at("2026-06-23T02:04:47")
+    assert naive is not None and naive.tzinfo == UTC
 
 
 def test_apply_prune_no_op_when_no_targets(tmp_path: Path) -> None:

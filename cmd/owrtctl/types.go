@@ -48,6 +48,19 @@ type jobSubmitResponse struct {
 	RunnerOutput string   `json:"runner_output"`
 }
 
+type jobReport struct {
+	JobID         string `json:"job_id"`
+	Success       bool   `json:"success"`
+	State         string `json:"state"`
+	BuildMetadata struct {
+		Profile string `json:"profile"`
+	} `json:"build_metadata"`
+	Artifact struct {
+		HostPath string `json:"host_path"`
+		Filename string `json:"filename"`
+	} `json:"artifact"`
+}
+
 type runnerStatus struct {
 	JobID      string `json:"job_id"`
 	Status     string `json:"status"`

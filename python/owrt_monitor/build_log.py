@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # enw-device-firmware top-level Makefile prints this on a successful build.
-# Example: ">>>> owrt2102.asus_mt_wifi7_mt7987  Build done in: 05:07.537"
+# Example: ">>>> owrt2102.asus_eap5000_mt7987  Build done in: 05:07.537"
 _SUCCESS_DONE = re.compile(r"^>>>> (?P<target>\S+)\s+Build done in:\s+(?P<duration>[\d:\.]+)\s*$")
 
 # `No space left on device` is high-signal: if it appears anywhere in the log we
@@ -14,7 +14,7 @@ _SUCCESS_DONE = re.compile(r"^>>>> (?P<target>\S+)\s+Build done in:\s+(?P<durati
 _DISK_FULL = re.compile(r"No space left on device", re.IGNORECASE)
 
 # Final make target that failed at the top level — the profile name itself.
-# Example: "make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2"
+# Example: "make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2"
 _TOPLEVEL_FAIL = re.compile(
     r"^make:\s+\*\*\*\s+\[(?P<makefile>[^\]]+):\s*(?P<target>\S+)\]\s+Error\s+\d+\s*$"
 )

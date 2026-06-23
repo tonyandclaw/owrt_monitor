@@ -125,6 +125,46 @@ def test_build_workflow_end_to_end_happy_path(tmp_path: Path) -> None:
     assert "SUCCEEDED" in report_md
 
 
+def test_build_resolves_host_interface_before_docker_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _write_config(
+        tmp_path,
+        upgrade={
+            "transfer": "tftp",
+            "host_interface": "USB 10/100/1000 LAN",
+            "tftp_host": "192.0.2.66",
+        },
+    )
+    events: list[str] = []
+
+    def fake_infer(interface: str) -> str:
+        events.append("host_lookup")
+        assert interface == "USB 10/100/1000 LAN"
+        return "192.168.1.77"
+
+    class RecordingFakeDocker(FakeDockerBuildClient):
+        def preflight(self) -> None:
+            events.append("docker_preflight")
+            super().preflight()
+
+        def run_build(self, *args, **kwargs) -> None:
+            events.append("docker_run_build")
+            super().run_build(*args, **kwargs)
+
+    monkeypatch.setattr("owrt_monitor.dut_workflow.infer_host_for_interface", fake_infer)
+    fake = RecordingFakeDocker(builder=_builder_from_config(config_path))
+    workflow = BuildWorkflow(config_path, docker_client=fake)
+
+    report = workflow.run(dry_run=False, allow_flash=False)
+
+    assert report.success is True
+    assert events[:3] == ["host_lookup", "docker_preflight", "docker_run_build"]
+    report_md = (report.run_dir / "report.md").read_text(encoding="utf-8")
+    assert "Firmware host interface: `USB 10/100/1000 LAN` -> `192.168.1.77`" in report_md
+
+
 def test_build_workflow_captures_provenance_metadata(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path)
     fake = FakeDockerBuildClient(builder=_builder_from_config(config_path))
@@ -153,18 +193,20 @@ def test_build_workflow_captures_provenance_metadata(tmp_path: Path) -> None:
 def test_build_workflow_metadata_records_active_profile(tmp_path: Path) -> None:
     raw = yaml.safe_load(_write_config(tmp_path).read_text(encoding="utf-8"))
     raw["profiles"] = {
-        "ap": {"builder": {"command": ["make", "owrt2102.asus_mt_wifi7_mt7987"]}}
+        "ap-be5000": {"builder": {"command": ["make", "owrt2102.asus_eap5000_mt7987"]}}
     }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    fake = FakeDockerBuildClient(builder=load_config(config_path).with_profile("ap").builder)
-    workflow = BuildWorkflow(config_path, profile="ap", docker_client=fake)
+    fake = FakeDockerBuildClient(
+        builder=load_config(config_path).with_profile("ap-be5000").builder
+    )
+    workflow = BuildWorkflow(config_path, profile="ap-be5000", docker_client=fake)
     report = workflow.run(dry_run=False, allow_flash=False)
 
     assert report.build_metadata is not None
-    assert report.build_metadata["profile"] == "ap"
-    assert report.build_metadata["make_target"] == "owrt2102.asus_mt_wifi7_mt7987"
+    assert report.build_metadata["profile"] == "ap-be5000"
+    assert report.build_metadata["make_target"] == "owrt2102.asus_eap5000_mt7987"
 
 
 def test_build_workflow_tolerates_metadata_gather_failure(tmp_path: Path) -> None:
@@ -466,6 +508,80 @@ def test_build_workflow_full_flow_with_allow_flash(tmp_path: Path) -> None:
     assert workflow.store.acquire_dut_lock(
         dut_name=config.dut.name, owner_job_id="next_job"
     ) is True
+
+
+def test_build_workflow_sets_dhcp_after_upgrade_before_tests(tmp_path: Path) -> None:
+    raw = yaml.safe_load(_write_config(tmp_path).read_text(encoding="utf-8"))
+    raw["upgrade"] = {
+        "transfer": "http",
+        "remote_path": "/tmp/firmware.bin",
+        "command": "sysupgrade -n /tmp/firmware.bin",
+        "boot_timeout_sec": 5,
+        "transfer_timeout_sec": 5,
+        "http_host": "127.0.0.1",
+        "verify_sha256": True,
+        "post_upgrade_network": {
+            "ensure_dhcp": True,
+            "interface": "br-lan",
+        },
+    }
+    raw["dut"] = {
+        "name": "dut-int",
+        "serial": "/dev/fake",
+        "prompt": r"root@OpenWrt:.*# ",
+        "connect_timeout_sec": 1,
+        "command_timeout_sec": 1,
+    }
+    raw["tests"] = {
+        "smoke": ["ubus call system board"],
+        "command_timeout_sec": 1,
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    config = load_config(config_path)
+
+    prompt = b"root@OpenWrt:/# "
+    status_json = b'{"kernel":"5.15.0","hostname":"OpenWrt"}\n'
+    transport = _FakeSerialTransport(
+        [
+            prompt,
+            b"download ok\n" + prompt,
+            b"size ok\n" + prompt,
+            b"sha ok\n" + prompt,
+            b"rebooted\n" + prompt,
+            b"OWRT_NETWORK_SECTION=lan\n" + prompt,
+            b"OWRT_POST_UPGRADE_NETWORK=section:lan,proto:dhcp\n" + prompt,
+            status_json + prompt,
+            b"board ok\n" + prompt,
+        ]
+    )
+    fake_session = SerialSession(
+        port="/dev/fake",
+        baud=115200,
+        prompt=config.dut.prompt,
+        transcript_path=tmp_path / "serial.log",
+        transport=transport,
+    )
+    workflow = BuildWorkflow(
+        config_path,
+        docker_client=FakeDockerBuildClient(builder=config.builder),
+        dut_workflow_kwargs={
+            "serial_session": fake_session,
+            "firmware_server": FakeFirmwareServer(port=8888),
+        },
+    )
+
+    report = workflow.run(dry_run=False, allow_flash=True)
+
+    assert report.success is True
+    written = b"".join(transport.writes)
+    assert b"OWRT_NETWORK_SECTION" in written
+    assert b"uci set network.$section.proto=dhcp" in written
+    assert b"uci commit network" in written
+    assert written.index(b"sysupgrade -n") < written.index(b"OWRT_NETWORK_SECTION")
+    assert written.index(b"uci set network.$section.proto=dhcp") < written.index(
+        b"ubus call system board"
+    )
 
 
 def test_build_workflow_reconnects_serial_during_reboot_wait(tmp_path: Path) -> None:

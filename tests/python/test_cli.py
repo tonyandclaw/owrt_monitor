@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import yaml
 from owrt_monitor.cli import (
     _compact_process_output,
     _daemon_job_payload,
     _inspection_result_line,
+    _latest_flash_artifact,
     _mark_orphaned_job,
     _network_readiness,
     _ping_command,
@@ -15,10 +17,12 @@ from owrt_monitor.cli import (
     _serial_readiness,
     _submit_daemon_job,
     _transfer_readiness,
+    app,
 )
 from owrt_monitor.reports import WorkflowReport, write_report
 from owrt_monitor.state import JobState
 from owrt_monitor.storage import JobStore
+from typer.testing import CliRunner
 
 
 def test_post_upgrade_summary_includes_all_runner_types(tmp_path) -> None:
@@ -124,6 +128,98 @@ def test_daemon_job_payload_resolves_paths(tmp_path) -> None:
     assert payload["working_dir"]
 
 
+def test_latest_flash_artifact_uses_newest_successful_profile_match(tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    artifact_root = tmp_path / "artifacts"
+    config.write_text(
+        yaml.safe_dump(
+            {
+                "project": {"artifact_dir": str(artifact_root)},
+                "builder": {"container": "x", "workdir": "/w", "command": ["make"]},
+                "artifact": {"patterns": ["*.bin"]},
+                "profiles": {
+                    "ap": {"builder": {"command": ["make", "ap"]}},
+                    "controller": {"builder": {"command": ["make", "controller"]}},
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    old_ap = tmp_path / "old-ap.bin"
+    new_ap = tmp_path / "new-ap.bin"
+    controller = tmp_path / "controller.bin"
+    for path in (old_ap, new_ap, controller):
+        path.write_bytes(b"fw")
+    _write_report(
+        artifact_root / "job_old_ap" / "report.json",
+        job_id="job_old_ap",
+        success=True,
+        profile="ap",
+        host_path=old_ap,
+        finished_at="2026-05-01T00:00:00Z",
+    )
+    _write_report(
+        artifact_root / "job_controller" / "report.json",
+        job_id="job_controller",
+        success=True,
+        profile="controller",
+        host_path=controller,
+        finished_at="2026-05-03T00:00:00Z",
+    )
+    _write_report(
+        artifact_root / "job_new_ap" / "report.json",
+        job_id="job_new_ap",
+        success=True,
+        profile="ap",
+        host_path=new_ap,
+        finished_at="2026-05-02T00:00:00Z",
+    )
+
+    artifact, job_id = _latest_flash_artifact(config, "ap")
+
+    assert artifact == new_ap
+    assert job_id == "job_new_ap"
+
+
+def test_flash_command_defaults_artifact_and_allow_flash(monkeypatch, tmp_path) -> None:
+    config = tmp_path / "config.yaml"
+    artifact = tmp_path / "firmware.bin"
+    config.write_text("project: {}\n", encoding="utf-8")
+    artifact.write_bytes(b"fw")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "owrt_monitor.cli._latest_flash_artifact",
+        lambda config, profile: (artifact, "job_latest"),
+    )
+
+    def fake_run_flash_workflow(config, *, artifact, dry_run, allow_flash, profile=None):
+        captured.update(
+            {
+                "config": config,
+                "artifact": artifact,
+                "dry_run": dry_run,
+                "allow_flash": allow_flash,
+                "profile": profile,
+            }
+        )
+
+    monkeypatch.setattr("owrt_monitor.cli._run_flash_workflow", fake_run_flash_workflow)
+
+    result = CliRunner().invoke(app, ["flash", "--config", str(config), "--profile", "ap"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {
+        "config": config,
+        "artifact": artifact,
+        "dry_run": False,
+        "allow_flash": True,
+        "profile": "ap",
+    }
+    assert "Using latest artifact from" in result.output
+
+
 def test_serial_readiness_reports_missing_configured_port(monkeypatch) -> None:
     monkeypatch.setattr(
         "owrt_monitor.cli.discover_serial_ports",
@@ -176,12 +272,28 @@ def test_transfer_readiness_requires_writable_tftp_root(monkeypatch, tmp_path) -
             transfer="tftp",
             tftp_host="192.168.1.66",
             http_host=None,
+            host_interface=None,
             tftp_root=tmp_path,
         )
     )
 
     assert ok is False
     assert "not writable" in detail
+
+
+def test_transfer_readiness_accepts_host_interface_for_tftp(tmp_path) -> None:
+    ok, detail = _transfer_readiness(
+        SimpleNamespace(
+            transfer="tftp",
+            tftp_host=None,
+            http_host=None,
+            host_interface="bridge100",
+            tftp_root=tmp_path,
+        )
+    )
+
+    assert ok is True
+    assert "host_interface=bridge100" in detail
 
 
 def test_network_readiness_pings_configured_dut(monkeypatch) -> None:
@@ -288,3 +400,27 @@ def test_submit_daemon_job_posts_to_owrtd(monkeypatch, tmp_path) -> None:
         "allow_flash": False,
         "working_dir": captured["payload"]["working_dir"],
     }
+
+
+def _write_report(
+    path,
+    *,
+    job_id: str,
+    success: bool,
+    profile: str,
+    host_path,
+    finished_at: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "success": success,
+                "finished_at": finished_at,
+                "build_metadata": {"profile": profile},
+                "artifact": {"host_path": str(host_path)},
+            }
+        ),
+        encoding="utf-8",
+    )

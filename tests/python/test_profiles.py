@@ -8,7 +8,11 @@ from owrt_monitor.config import ConfigError, load_config
 from owrt_monitor.workflow import BuildWorkflow
 
 
-def _write_config(tmp_path: Path, profiles: dict | None = None) -> Path:
+def _write_config(
+    tmp_path: Path,
+    profiles: dict | None = None,
+    default_profile: str | None = None,
+) -> Path:
     raw: dict = {
         "project": {"artifact_dir": str(tmp_path / "artifacts")},
         "builder": {
@@ -24,6 +28,8 @@ def _write_config(tmp_path: Path, profiles: dict | None = None) -> Path:
         },
         "dut": {"serial": "/dev/fake"},
     }
+    if default_profile is not None:
+        raw["project"]["default_profile"] = default_profile
     if profiles is not None:
         raw["profiles"] = profiles
     path = tmp_path / "config.yaml"
@@ -35,10 +41,12 @@ def test_with_profile_overlays_command_and_pattern(tmp_path: Path) -> None:
     config_path = _write_config(
         tmp_path,
         profiles={
-            "ap": {
-                "builder": {"command": ["make", "owrt2102.asus_mt_wifi7_mt7987"]},
+            "ap-be5000": {
+                "builder": {"command": ["make", "owrt2102.asus_eap5000_mt7987"]},
                 "artifact": {
-                    "patterns": ["build/owrt2102/bin/target/openwrt-*-emmc-sysupgrade.bin"]
+                    "patterns": [
+                        "build/owrt2102/bin/target/openwrt-*-ASUS-EAP5000-sysupgrade.bin"
+                    ]
                 },
             },
         },
@@ -46,10 +54,10 @@ def test_with_profile_overlays_command_and_pattern(tmp_path: Path) -> None:
     base = load_config(config_path)
     assert base.builder.command == ["make"]
 
-    ap = base.with_profile("ap")
-    assert ap.builder.command == ["make", "owrt2102.asus_mt_wifi7_mt7987"]
-    assert ap.artifact.patterns == [
-        "build/owrt2102/bin/target/openwrt-*-emmc-sysupgrade.bin"
+    ap_be5000 = base.with_profile("ap-be5000")
+    assert ap_be5000.builder.command == ["make", "owrt2102.asus_eap5000_mt7987"]
+    assert ap_be5000.artifact.patterns == [
+        "build/owrt2102/bin/target/openwrt-*-ASUS-EAP5000-sysupgrade.bin"
     ]
     # Base config must be unchanged.
     assert base.builder.command == ["make"]
@@ -69,7 +77,10 @@ def test_with_profile_deep_merges_nested_dicts(tmp_path: Path) -> None:
 
 
 def test_with_profile_unknown_name_raises(tmp_path: Path) -> None:
-    config_path = _write_config(tmp_path, profiles={"ap": {"builder": {"command": ["m"]}}})
+    config_path = _write_config(
+        tmp_path,
+        profiles={"ap-be5000": {"builder": {"command": ["m"]}}},
+    )
     cfg = load_config(config_path)
     with pytest.raises(ConfigError, match="unknown profile 'switch'"):
         cfg.with_profile("switch")
@@ -91,18 +102,54 @@ def test_workflow_accepts_profile_param(tmp_path: Path) -> None:
     config_path = _write_config(
         tmp_path,
         profiles={
-            "ap": {
-                "builder": {"command": ["make", "owrt2102.asus_mt_wifi7_mt7987"]},
+            "ap-be5000": {
+                "builder": {"command": ["make", "owrt2102.asus_eap5000_mt7987"]},
             },
         },
     )
-    workflow = BuildWorkflow(config_path, profile="ap")
-    assert workflow.profile == "ap"
-    assert workflow.config.builder.command[-1] == "owrt2102.asus_mt_wifi7_mt7987"
+    workflow = BuildWorkflow(config_path, profile="ap-be5000")
+    assert workflow.profile == "ap-be5000"
+    assert workflow.config.builder.command[-1] == "owrt2102.asus_eap5000_mt7987"
+
+
+def test_workflow_uses_project_default_profile(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        profiles={
+            "ap-be5000": {
+                "builder": {"command": ["make", "owrt2102.asus_eap5000_mt7987"]},
+            },
+        },
+        default_profile="ap-be5000",
+    )
+
+    workflow = BuildWorkflow(config_path)
+
+    assert workflow.profile == "ap-be5000"
+    assert workflow.config.builder.command[-1] == "owrt2102.asus_eap5000_mt7987"
+
+
+def test_unknown_default_profile_raises(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        profiles={"ap-be5000": {"builder": {"command": ["m"]}}},
+        default_profile="missing",
+    )
+    with pytest.raises(ConfigError, match="project.default_profile 'missing'"):
+        load_config(config_path)
+
+
+def test_default_profile_requires_profiles_block(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, default_profile="ap-be5000")
+    with pytest.raises(ConfigError, match="no profiles defined"):
+        load_config(config_path)
 
 
 def test_workflow_unknown_profile_raises(tmp_path: Path) -> None:
-    config_path = _write_config(tmp_path, profiles={"ap": {"builder": {"command": ["m"]}}})
+    config_path = _write_config(
+        tmp_path,
+        profiles={"ap-be5000": {"builder": {"command": ["m"]}}},
+    )
     with pytest.raises(ConfigError, match="unknown profile"):
         BuildWorkflow(config_path, profile="not-a-profile")
 

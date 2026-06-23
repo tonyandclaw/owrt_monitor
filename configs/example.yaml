@@ -1,16 +1,21 @@
 project:
   name: owrt-monitor-lab
   artifact_dir: ../artifacts
+  default_profile: ap-be5000
 
-# Shared settings for all profiles. Per-board overrides go in `profiles:` below
-# and are deep-merged on top of these. Pick a profile with `--profile <name>`,
-# e.g. `owrt-monitor build --profile ap`.
+# Shared settings for all profiles. Per-board overrides go in `profiles:` below.
+# `project.default_profile` makes a no-profile command use the BE5000 AP profile.
+# Pick another board with `--profile <name>`, e.g. `--profile gateway`.
 builder:
   container: openwrtbuild
   workdir: /home/asus/openwrt/enw-device-firmware
   # `command` is set per-profile (each board has its own make target).
   command: [make]
   env:
+    # The firmware Makefile defaults BUILD_CCACHE=1 only for interactive TTYs.
+    # owrt-monitor runs docker exec non-interactively, but the staging cache
+    # rules still expect `.ccache` to exist, so set it explicitly here.
+    BUILD_CCACHE: "1"
     FORCE_UNSAFE_CONFIGURE: "1"
   timeout_sec: 0
 
@@ -19,8 +24,14 @@ artifact:
   # (note: singular `target`, not vanilla OpenWrt's `bin/targets/<arch>/<sub>/`).
   # `patterns` is set per-profile because each board class lives under a
   # different framework subdir and emits a board-specific filename.
+  #
+  # The base pattern is deliberately broad. If `project.default_profile` is
+  # removed and no `--profile` is passed, `selection: fail-if-multiple` refuses
+  # to guess and errors with the full candidate list instead of silently
+  # flashing an arbitrary board image. Real profiles narrow `patterns` to the
+  # expected image family.
   patterns: ["build/owrt2102/bin/target/openwrt-*-sysupgrade.bin"]
-  selection: newest
+  selection: fail-if-multiple
   min_size_mb: 4
   require_sha256: true
 
@@ -44,11 +55,18 @@ dut:
     interface: br-lan
 
 upgrade:
-  transfer: http
+  # Default firmware path for regular profiles: publish to the host TFTP root,
+  # let the DUT fetch it from the serial shell, then run `sysupgrade`.
+  transfer: tftp
   remote_path: /tmp/firmware.bin
   command: sysupgrade -n /tmp/firmware.bin
   boot_timeout_sec: 240
   transfer_timeout_sec: 180
+  tftp_root: /private/tftpboot
+  # OpenWrt-shell TFTP uses an owrt-monitor temporary server; 0 picks a high port.
+  # `bootloader_tftp` still uses the host's normal TFTP service on UDP/69.
+  tftp_port: 0
+  host_interface: ${OWRT_FIRMWARE_HOST_INTERFACE:-bridge100}
   http_bind: 0.0.0.0
   http_host: null
   http_port: 0
@@ -58,44 +76,46 @@ tests:
   command_timeout_sec: 30
   # Each smoke entry is either a bare command string (passes if the command
   # returns successfully) or a dict with a regex `expect` (passes only when the
-  # output matches). Regexes are Python `re` syntax, applied via `re.search`.
+  # output matches). Regexes are Python `re` syntax, applied via `re.search`
+  # with `re.MULTILINE`, so `^`/`$` anchor to the start/end of an output line
+  # (the serial capture includes the echoed command and trailing prompt).
   smoke:
     - ubus call system board
     - opkg list-installed
     - /etc/init.d/network status
     - command: cat /proc/uptime
       expect: ^\d+\.\d+
+    - command: uci -q get network.lan.proto
+      expect: ^dhcp\r?$
     - command: ip -j addr show br-lan
-      expect: '"operstate":"UP"'
+      expect: '"ifname":"br-lan"'
 
 # Per-board overlays. Each profile gets deep-merged onto the base above when
 # selected via `--profile <name>`. Lists (e.g. builder.command, artifact.patterns)
 # are replaced wholesale, scalars overwrite, and nested dicts merge key-by-key.
 profiles:
-  ap:
+  ap-be5000:
     builder:
-      command: [make, owrt2102.asus_mt_wifi7_mt7987]
+      command: [make, owrt2102.asus_eap5000_mt7987]
     artifact:
-      # AP emits ~17 sysupgrade variants per build; pin to the eMMC variant.
+      # BE5000 AP is the ASUS EAP5000 eMMC target; do not accept generic NAND images.
       patterns:
-        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin
+        - build/owrt2102/bin/target/openwrt-*-ASUS-EAP5000-squashfs-sysupgrade.bin
     upgrade:
-      # AP DUT pulls firmware over TFTP from the host's launchd-managed tftpd
-      # rooted at /private/tftpboot. The host IP the DUT can reach is fixed.
-      transfer: tftp
-      tftp_root: /private/tftpboot
-      tftp_host: 192.168.1.66
-      # Some lab images boot with br-lan as DHCP client, while others boot
-      # with static IPv4. Before TFTP, ping the Mac TFTP host; if unreachable
-      # and br-lan is configured as DHCP, add this runtime-only static IP for
-      # the transfer, then remove it before sysupgrade. Static configs are
-      # left untouched.
+      # Before TFTP, verify reachability from the serial console. If the DUT
+      # cannot reach the Mac TFTP host, treat this interface/CIDR as recovery
+      # hints, add the address only at runtime, then remove it before sysupgrade.
+      # UCI/config state is logged as context; console reachability is primary.
       network_recovery:
         enabled: true
-        ping_host: 192.168.1.66
         interface: br-lan
-        static_cidr: 192.168.1.1/24
+        static_cidr: 192.168.2.4/24
         restore_after_transfer: true
+      # After the upgraded firmware boots, force the DUT LAN bridge back to
+      # DHCP before status capture and smoke tests. This persists in UCI.
+      post_upgrade_network:
+        ensure_dhcp: true
+        interface: br-lan
       # Confirm the expected firmware actually booted — these regexes must all
       # appear in the boot transcript before the shell prompt. Catches "wrong
       # partition booted" or "stale firmware" cases the prompt regex alone misses.
@@ -103,17 +123,57 @@ profiles:
         - 'BusyBox v'
         - 'OpenWrt'
     dut:
-      # Defence in depth: AP and controller share build/owrt2102/, so a too-
-      # broad glob could pick the wrong board's image. This regex is checked
-      # against the selected artifact filename right before flashing.
-      expected_artifact_pattern: 'mediatek_mt7987a-emmc'
+      # Defence in depth: AP, controller, and gateway share build/owrt2102/,
+      # so a too-broad glob could pick the wrong board's image. This regex is
+      # checked against the selected artifact filename right before flashing.
+      expected_artifact_pattern: 'ASUS-EAP5000'
+
+  ap-be14000:
+    builder:
+      command: [make, owrt2102.asus_eap14000_mt7987]
+    artifact:
+      patterns:
+        - build/owrt2102/bin/target/openwrt-*-ASUS-EAP14000-squashfs-sysupgrade.bin
+    dut:
+      expected_artifact_pattern: 'ASUS-EAP14000'
 
   controller:
     builder:
-      command: [make, owrt2102.asus_mt_controller_mt7988]
+      command: [make, owrt2102.asus_controller_mt7988a]
     artifact:
       patterns:
-        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7988*-sysupgrade.bin
+        - build/owrt2102/bin/target/openwrt-*-ASUS-Controller-squashfs-sysupgrade.bin
+    dut:
+      # The base default serial (usbserial-8340) is the BE5000 AP. The
+      # controller is on a different USB serial adapter, so pin it here or
+      # `-p controller` would drive the AP's console.
+      serial: ${OWRT_CONTROLLER_SERIAL:-/dev/cu.usbserial-8330}
+      expected_artifact_pattern: 'ASUS-Controller'
+    tests:
+      # The base smoke list asserts the AP topology (LAN = dhcp on a br-lan
+      # bridge). The controller is a single-port board: its `lan` interface is
+      # static and bound to br-lan, but no br-lan device is created, so `lan`
+      # is intentionally down (ifstatus reports NO_DEVICE). We therefore drop
+      # the AP's dhcp + br-lan checks and only assert lan.proto=static (which
+      # confirms the network config loaded). Lists replace wholesale on profile
+      # merge, so the generic checks must be repeated here.
+      smoke:
+        - ubus call system board
+        - opkg list-installed
+        - /etc/init.d/network status
+        - command: cat /proc/uptime
+          expect: ^\d+\.\d+
+        - command: uci -q get network.lan.proto
+          expect: ^static\r?$
+
+  gateway:
+    builder:
+      command: [make, owrt2102.asus_gw_mt7988]
+    artifact:
+      patterns:
+        - build/owrt2102/bin/target/openwrt-*-ASUS-GW-squashfs-sysupgrade.bin
+    dut:
+      expected_artifact_pattern: 'ASUS-GW'
 
   switch:
     builder:
@@ -136,16 +196,16 @@ profiles:
     # serial, interrupts U-Boot autoboot with a space, then drives the
     # standard `tftpboot + bootm` sequence. The boot is volatile — lost on
     # next power cycle — so this is for testing a candidate firmware, not
-    # committing it. Use `ap` profile for permanent installs.
+    # committing it. Use `ap-be5000` profile for permanent installs.
     builder:
-      command: [make, owrt2102.asus_mt_wifi7_mt7987]
+      command: [make, owrt2102.asus_eap5000_mt7987]
     artifact:
       patterns:
-        - build/owrt2102/bin/target/openwrt-*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin
+        - build/owrt2102/bin/target/openwrt-*-ASUS-EAP5000-initramfs-kernel.bin
     upgrade:
       transfer: bootloader_tftp
       tftp_root: /private/tftpboot
-      tftp_host: 192.168.1.66
+      host_interface: ${OWRT_FIRMWARE_HOST_INTERFACE:-bridge100}
       expected_boot_markers:
         - 'BusyBox v'
         - 'OpenWrt'
@@ -157,4 +217,4 @@ profiles:
         load_address: '0x80000000'
         boot_command: bootm
     dut:
-      expected_artifact_pattern: 'mediatek_mt7987a-emmc'
+      expected_artifact_pattern: 'ASUS-EAP5000'

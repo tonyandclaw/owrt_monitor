@@ -11,7 +11,8 @@ expensive to skip.
 ## Before you flash
 
 1. **Confirm the right artifact for the right DUT.**
-   - AP boards take `*-mediatek_mt7987a-emmc-squashfs-sysupgrade.bin` (eMMC variant).
+   - BE5000 AP boards take the ASUS EAP5000 eMMC sysupgrade image, not generic
+     `mediatek_mt7987a-spim-nand`.
    - Other boards have other suffixes; flashing the wrong variant is a common cause of
      boot failures even when the build itself succeeds.
    - The `artifact.patterns` glob in your active profile should be specific enough to
@@ -50,8 +51,8 @@ expensive to skip.
    - Set `upgrade.min_dut_free_kb` to at least the firmware size; the workflow will
      pre-check before transferring.
 
-6. **For TFTP transfer:** confirm `tftpd` is running on the host and `/private/tftpboot`
-   is writable.
+6. **For TFTP transfer:** confirm `/private/tftpboot` is writable. For
+   `bootloader_tftp`, also confirm the host `tftpd` service is running on UDP/69.
 
    ```sh
    sudo launchctl list com.apple.tftpd
@@ -74,15 +75,18 @@ What this does, in order:
 
 1. Acquires the DUT lock (sqlite-backed, with stale-recovery after `dut.lock_timeout_sec`).
 2. Opens the serial console and waits for the prompt.
-3. Publishes the firmware: copies into `tftp_root` for TFTP, starts a temporary HTTP
-   server for HTTP transfers, runs `scp`, or runs `custom_transfer_command`.
+3. Publishes the firmware: copies into `tftp_root` and starts a temporary TFTP server
+   for shell TFTP, starts a temporary HTTP server for HTTP transfers, runs `scp`, or
+   runs `custom_transfer_command`.
 4. Tells the DUT to fetch the firmware (`tftp -g` or `wget`), unless SCP/custom host
    command handles transfer.
 5. Verifies the size, and (if `verify_sha256: true`) the SHA256 hash, on the DUT side.
 6. Runs the configured upgrade command (`sysupgrade -n /tmp/firmware.bin` by default).
 7. Waits for the prompt to return — fails fast on any `boot_failure_patterns` regex.
-8. Runs configured smoke tests.
-9. Releases the DUT lock.
+8. Applies any configured `upgrade.post_upgrade_network` normalization, such as forcing
+   `br-lan` back to DHCP after the upgraded image boots.
+9. Runs configured smoke tests.
+10. Releases the DUT lock.
 
 If any configured smoke, custom script, pytest, or SSH test fails, the job is marked
 `FAILED` and the report keeps the failing output section for triage.

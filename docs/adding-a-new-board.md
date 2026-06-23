@@ -16,7 +16,7 @@ Before writing any config, collect:
 | Serial baud | Vendor docs (often 115200) |
 | Shell prompt regex | Connect manually with `screen` / `picocom` and observe |
 | DUT IP | `ip a` once it's booted |
-| Reachable host IP from the DUT | Whichever host interface is on the same subnet |
+| Reachable host interface/IP from the DUT | Host interface/service name such as `bridge100`, or a fixed host IP |
 
 ## Add the profile
 
@@ -32,9 +32,12 @@ profiles:
       patterns:
         - build/owrt2102/bin/target/openwrt-*-your_board-sysupgrade.bin
     upgrade:
-      transfer: tftp                    # or http if no tftpd
+      transfer: tftp                    # monitor-managed shell TFTP
       tftp_root: /private/tftpboot      # default
-      tftp_host: 192.168.1.66           # this host's IP, reachable from the DUT
+      tftp_port: 0                      # auto high port
+      host_interface: bridge100
+      # Or, if the host IP is truly static:
+      # tftp_host: 192.168.1.66
       command: sysupgrade -n /tmp/firmware.bin
     dut:
       name: newboard-01

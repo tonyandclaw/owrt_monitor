@@ -40,6 +40,9 @@ def select_artifact(
     min_size_mb: float = 0,
     regex_patterns: list[str] | None = None,
 ) -> ArtifactCandidate:
+    if not candidates:
+        raise ArtifactSelectionError("no artifacts matched the configured artifact patterns")
+
     minimum_bytes = int(min_size_mb * 1024 * 1024)
     eligible = [candidate for candidate in candidates if candidate.size_bytes >= minimum_bytes]
 

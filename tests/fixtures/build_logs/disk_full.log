@@ -19,4 +19,4 @@ make[3]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt210
 Failed to build tmp/.config-package.in
 make[2]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
 make[1]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
-make: *** [include/owrt2102.mk:163: owrt2102.asus_mt_wifi7_mt7987] Error 2
+make: *** [include/owrt2102.mk:163: owrt2102.asus_eap5000_mt7987] Error 2

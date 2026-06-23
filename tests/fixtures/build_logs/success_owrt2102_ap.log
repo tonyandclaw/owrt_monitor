@@ -243,4 +243,4 @@ WARNING: Makefile 'package/kernel/mac80211/Makefile' has a dependency on 'rtl872
 WARNING: Makefile 'package/feeds/mtk/tops-tool/Makefile' has a dependency on 'kmod-tops', which does not exist
 WARNING: Makefile 'package/mtk/drivers/warp/Makefile' has a dependency on 'kmod-hw_nat', which does not exist
 make[1]: Leaving directory '/home/asus/openwrt/enw-device-firmware/build/owrt2102'
->>>> owrt2102.asus_mt_wifi7_mt7987  Build done in: 05:07.537
+>>>> owrt2102.asus_eap5000_mt7987  Build done in: 05:07.537

@@ -76,9 +76,8 @@ class BuildWorkflow:
         dut_workflow_kwargs: dict[str, object] | None = None,
     ) -> None:
         self.config_path = Path(config_path).resolve()
-        self.profile = profile
         try:
-            self.config: OwrtConfig = _load_with_profile(self.config_path, profile)
+            self.config, self.profile = _load_with_profile(self.config_path, profile)
         except ConfigError:
             raise
         self.artifact_root = self.config.artifact_root(self.config_path)
@@ -158,6 +157,10 @@ class BuildWorkflow:
             )
             if allow_flash:
                 report.actions.extend(dut_workflow.planned_actions())
+            else:
+                host_action = dut_workflow.firmware_host_plan_action()
+                if host_action is not None:
+                    report.actions.append(host_action)
 
             if dry_run:
                 report.state = JobState.DRY_RUN.value
@@ -404,6 +407,9 @@ class BuildWorkflow:
             )
 
             if skip_export:
+                assert existing_artifact is not None
+                if allow_flash or dry_run:
+                    _assert_artifact_matches_dut(resumed_config, existing_artifact)
                 report.actions.append(
                     f"Reusing exported artifact: `{existing_artifact.host_path}`"
                 )
@@ -711,11 +717,12 @@ def _new_job_id() -> str:
     return "job_" + uuid.uuid4().hex[:12]
 
 
-def _load_with_profile(config_path: Path, profile: str | None) -> OwrtConfig:
+def _load_with_profile(config_path: Path, profile: str | None) -> tuple[OwrtConfig, str | None]:
     config = load_config(config_path)
-    if profile is None:
-        return config
-    return config.with_profile(profile)
+    effective_profile = config.effective_profile(profile)
+    if effective_profile is None:
+        return config, None
+    return config.with_profile(effective_profile), effective_profile
 
 
 def _emit_config_diff_from_last_success(
@@ -769,8 +776,8 @@ def _assert_artifact_matches_dut(
     """Verify the firmware filename matches `dut.expected_artifact_pattern`.
 
     Run-time guard against flashing the wrong board variant — important when
-    multiple profiles share a build subdir (e.g. AP and controller both live
-    in build/owrt2102/) and a too-broad glob could pick the wrong file.
+    multiple profiles share a build subdir (e.g. AP/controller/gateway all
+    live in build/owrt2102/) and a too-broad glob could pick the wrong file.
     No-op when the field is unset.
     """
     pattern = config.dut.expected_artifact_pattern
@@ -805,9 +812,8 @@ def _raise_if_post_upgrade_tests_failed(report: WorkflowReport) -> None:
 class FlashWorkflow:
     def __init__(self, config_path: Path | str, *, profile: str | None = None) -> None:
         self.config_path = Path(config_path).resolve()
-        self.profile = profile
         try:
-            self.config: OwrtConfig = _load_with_profile(self.config_path, profile)
+            self.config, self.profile = _load_with_profile(self.config_path, profile)
         except ConfigError:
             raise
         self.artifact_root = self.config.artifact_root(self.config_path)
@@ -872,6 +878,7 @@ class FlashWorkflow:
                 cancel_token=cancel_token,
             )
             report.actions.extend(dut_workflow.planned_actions(artifact))
+            _assert_artifact_matches_dut(self.config, artifact)
 
             if dry_run:
                 report.state = JobState.DRY_RUN.value
@@ -892,7 +899,6 @@ class FlashWorkflow:
 
             cancel_token.raise_if_cancelled()
             self._transition(logger, job_id, JobState.PREFLIGHT, "starting DUT flash preflight")
-            _assert_artifact_matches_dut(self.config, artifact)
             dut_workflow.preflight_serial_interactive()
             cancel_token.raise_if_cancelled()
             flash_metrics: dict[str, float] = {}
@@ -989,9 +995,8 @@ class FlashWorkflow:
 class SmokeTestWorkflow:
     def __init__(self, config_path: Path | str, *, profile: str | None = None) -> None:
         self.config_path = Path(config_path).resolve()
-        self.profile = profile
         try:
-            self.config: OwrtConfig = _load_with_profile(self.config_path, profile)
+            self.config, self.profile = _load_with_profile(self.config_path, profile)
         except ConfigError:
             raise
         self.artifact_root = self.config.artifact_root(self.config_path)

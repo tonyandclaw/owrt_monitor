@@ -62,7 +62,12 @@ DEFAULT_CONFIG = Path("configs/example.yaml")
 CONFIG_OPTION = typer.Option(DEFAULT_CONFIG, "--config", "-c")
 DRY_RUN_OPTION = typer.Option(False, "--dry-run", help="Plan the workflow without side effects.")
 LIMIT_OPTION = typer.Option(20, "--limit", min=1, max=100)
-ARTIFACT_OPTION = typer.Option(..., "--artifact", "-a", help="Host firmware image to flash.")
+ARTIFACT_OPTION = typer.Option(
+    None,
+    "--artifact",
+    "-a",
+    help="Host firmware image to flash. Defaults to the latest successful exported artifact.",
+)
 PROFILE_OPTION = typer.Option(
     None,
     "--profile",
@@ -84,19 +89,22 @@ def validate_config(
     """Validate an owrt_monitor YAML config."""
     try:
         loaded = load_config(config)
-        if profile is not None:
-            loaded = loaded.with_profile(profile)
+        available_profiles = loaded.list_profiles()
+        effective_profile = loaded.effective_profile(profile)
+        if effective_profile is not None:
+            loaded = loaded.with_profile(effective_profile)
     except ConfigError as exc:
         console.print(f"[red]Invalid config:[/red] {exc}")
         raise typer.Exit(1) from exc
 
     console.print(f"[green]Config OK[/green]: {config}")
-    if profile is not None:
-        console.print(f"Profile: [bold]{profile}[/bold]")
+    if effective_profile is not None:
+        suffix = " (default)" if profile is None else ""
+        console.print(f"Profile: [bold]{effective_profile}[/bold]{suffix}")
     console.print(f"Project: [bold]{loaded.project.name}[/bold]")
     console.print(f"Builder container: [bold]{loaded.builder.container}[/bold]")
-    if loaded.profiles:
-        console.print(f"Available profiles: [bold]{', '.join(sorted(loaded.profiles))}[/bold]")
+    if available_profiles:
+        console.print(f"Available profiles: [bold]{', '.join(available_profiles)}[/bold]")
 
 
 @app.command("lab-check")
@@ -107,8 +115,9 @@ def lab_check(
     """Check local lab readiness without building or touching a DUT."""
     try:
         loaded = load_config(config)
-        if profile is not None:
-            loaded = loaded.with_profile(profile)
+        effective_profile = loaded.effective_profile(profile)
+        if effective_profile is not None:
+            loaded = loaded.with_profile(effective_profile)
     except ConfigError as exc:
         console.print(f"[red]Invalid config:[/red] {exc}")
         raise typer.Exit(1) from exc
@@ -175,7 +184,7 @@ def run(
     dry_run_mode: bool = DRY_RUN_OPTION,
     daemon_url: str | None = DAEMON_URL_OPTION,
     allow_flash: bool = typer.Option(
-        False,
+        True,
         "--allow-flash",
         help="After build/export, transfer firmware to the DUT and run the upgrade command.",
     ),
@@ -197,21 +206,31 @@ def run(
 
 @app.command("flash")
 def flash(
-    artifact: Path = ARTIFACT_OPTION,
+    artifact: Path | None = ARTIFACT_OPTION,
     config: Path = CONFIG_OPTION,
     profile: str | None = PROFILE_OPTION,
     dry_run_mode: bool = DRY_RUN_OPTION,
     daemon_url: str | None = DAEMON_URL_OPTION,
     allow_flash: bool = typer.Option(
-        False,
+        True,
         "--allow-flash",
-        help="Permit the destructive DUT upgrade command.",
+        help=(
+            "Permit the destructive DUT upgrade command. Enabled by default; "
+            "use --dry-run to preview."
+        ),
     ),
 ) -> None:
     """Transfer an existing firmware image to the DUT and run the configured upgrade flow."""
-    if not dry_run_mode and not allow_flash:
-        console.print("[red]Refusing to flash without --allow-flash.[/red]")
-        raise typer.Exit(2)
+    try:
+        if artifact is None:
+            artifact, source_job = _latest_flash_artifact(config, profile)
+            console.print(
+                f"Using latest artifact from [bold]{source_job}[/bold]: "
+                f"[bold]{artifact}[/bold]"
+            )
+    except (ConfigError, WorkflowError) as exc:
+        console.print(f"[red]Workflow failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
     if daemon_url is not None:
         _submit_daemon_job(
             "flash",
@@ -618,6 +637,9 @@ def prune(
                                     help="Most-recent N failed jobs to keep."),
     keep_other: int = typer.Option(5, "--keep-other", min=0,
                                    help="Most-recent N jobs of any other result to keep."),
+    max_age_days: int = typer.Option(None, "--max-age-days", min=1,
+                                     help="Age-based mode: delete every job older than "
+                                          "N days, ignoring the --keep-* counts."),
     apply: bool = typer.Option(False, "--apply",
                                help="Actually delete. Without this flag, prune is dry-run."),
     limit: int = typer.Option(1000, "--limit", min=1, max=10000,
@@ -642,9 +664,16 @@ def prune(
         keep_success=keep_success,
         keep_failed=keep_failed,
         keep_other=keep_other,
+        max_age_days=max_age_days,
         artifact_root=artifact_root,
         limit=limit,
     )
+
+    if max_age_days is not None:
+        console.print(
+            f"Mode: [bold]age-based[/bold] — deleting jobs older than "
+            f"{max_age_days} day(s)."
+        )
 
     keep_summary = ", ".join(
         f"{result}={count}" for result, count in sorted(plan.kept_count_by_result.items())
@@ -860,15 +889,27 @@ def _serial_prompt_readiness(
 
 def _transfer_readiness(upgrade) -> tuple[bool, str]:
     if upgrade.transfer in {"tftp", "bootloader_tftp"}:
-        host = upgrade.tftp_host or upgrade.http_host
+        host = upgrade.tftp_host or upgrade.http_host or upgrade.host_interface
         if not host:
-            return False, "upgrade.tftp_host or upgrade.http_host is required"
+            return (
+                False,
+                "upgrade.tftp_host, upgrade.http_host, or upgrade.host_interface is required",
+            )
         root = Path(upgrade.tftp_root)
         if not root.exists():
             return False, f"TFTP root does not exist: {root}"
         if not os.access(root, os.W_OK):
             return False, f"TFTP root is not writable by this user: {root}"
-        return True, f"{upgrade.transfer} via {host}, root={root}"
+        via = (
+            "host_interface"
+            if upgrade.host_interface and host == upgrade.host_interface
+            else "host"
+        )
+        port = ""
+        if upgrade.transfer == "tftp":
+            tftp_port = getattr(upgrade, "tftp_port", 0)
+            port = f", port={tftp_port or 'auto'}"
+        return True, f"{upgrade.transfer} via {via}={host}, root={root}{port}"
     if upgrade.transfer == "scp":
         host = upgrade.scp_host
         return True, f"scp host={host or '<dut.network.address>'}"
@@ -916,6 +957,59 @@ def _compact_process_output(output: str) -> str:
         if "packet loss" in line.lower():
             return line
     return lines[-1]
+
+
+def _latest_flash_artifact(config: Path, profile: str | None) -> tuple[Path, str]:
+    config_path = config.resolve()
+    loaded = load_config(config_path)
+    effective_profile = loaded.effective_profile(profile)
+    if effective_profile is not None:
+        loaded = loaded.with_profile(effective_profile)
+    artifact_root = loaded.artifact_root(config_path)
+    if not artifact_root.exists():
+        raise WorkflowError(
+            f"no artifact directory found at {artifact_root}; pass --artifact explicitly"
+        )
+
+    candidates: list[tuple[str, float, Path, str]] = []
+    for report_path in artifact_root.glob("job_*/report.json"):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if report.get("success") is not True:
+            continue
+        if effective_profile is not None:
+            build_profile = (report.get("build_metadata") or {}).get("profile")
+            if str(build_profile or "").strip() != effective_profile:
+                continue
+        artifact = report.get("artifact") or {}
+        host_path = str(artifact.get("host_path") or "").strip()
+        if not host_path:
+            continue
+        firmware_path = Path(host_path).expanduser()
+        if not firmware_path.is_file():
+            continue
+        job_id = str(report.get("job_id") or report_path.parent.name)
+        sort_key = str(report.get("finished_at") or report.get("started_at") or "")
+        try:
+            mtime = report_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((sort_key, mtime, firmware_path, job_id))
+
+    if not candidates:
+        if effective_profile is not None:
+            raise WorkflowError(
+                "no successful job with an exported artifact was found "
+                f"for profile {effective_profile!r}; pass --artifact explicitly"
+            )
+        raise WorkflowError(
+            "no successful job with an exported artifact was found; pass --artifact explicitly"
+        )
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    _, _, firmware_path, job_id = candidates[0]
+    return firmware_path, job_id
 
 
 def _daemon_job_payload(

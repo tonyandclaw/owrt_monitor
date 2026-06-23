@@ -154,6 +154,68 @@ def test_flash_workflow_blocks_wrong_variant_too(tmp_path: Path) -> None:
         workflow.run(artifact_path=artifact_path, dry_run=False, allow_flash=True)
 
 
+def test_flash_workflow_dry_run_blocks_wrong_variant_too(tmp_path: Path) -> None:
+    artifact_path = tmp_path / "openwrt-mediatek_mt7987a-spim-nand-sysupgrade.bin"
+    artifact_path.write_bytes(b"x")
+    raw = {
+        "project": {"artifact_dir": str(tmp_path / "artifacts")},
+        "builder": {"container": "fake", "workdir": "/work", "command": ["make"]},
+        "artifact": {"patterns": ["*.bin"]},
+        "dut": {
+            "name": "ap-dut",
+            "serial": "/dev/fake",
+            "expected_artifact_pattern": "ASUS-EAP5000",
+        },
+        "upgrade": {"transfer": "http", "http_host": "127.0.0.1"},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    workflow = FlashWorkflow(config_path)
+
+    with pytest.raises(WorkflowError, match=r"does not match expected pattern.*ASUS-EAP5000"):
+        workflow.run(artifact_path=artifact_path, dry_run=True)
+
+
+def test_resume_dry_run_blocks_wrong_exported_variant(tmp_path: Path) -> None:
+    raw = {
+        "project": {"artifact_dir": str(tmp_path / "artifacts")},
+        "builder": {"container": "fake", "workdir": "/work", "command": ["make"]},
+        "artifact": {"patterns": ["*.bin"]},
+        "dut": {
+            "name": "ap-dut",
+            "serial": "/dev/fake",
+            "expected_artifact_pattern": "ASUS-EAP5000",
+        },
+        "upgrade": {"transfer": "http", "http_host": "127.0.0.1"},
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    workflow = BuildWorkflow(config_path)
+    store = JobStore(workflow.config.state_db_path(config_path.resolve()))
+    run_dir = workflow.artifact_root / "job_wrong_variant"
+    (run_dir / "firmware").mkdir(parents=True)
+    firmware = run_dir / "firmware" / "openwrt-mediatek_mt7987a-spim-nand-sysupgrade.bin"
+    firmware.write_bytes(b"x")
+    store.create_job(
+        job_id="job_wrong_variant",
+        config_path=config_path,
+        artifact_dir=run_dir,
+        state=JobState.ARTIFACT_EXPORTED.value,
+        config_snapshot=workflow.config.redacted_dump(),
+    )
+    store.record_artifact(
+        job_id="job_wrong_variant",
+        container_path="/work/openwrt/bin/openwrt.bin",
+        host_path=firmware,
+        filename=firmware.name,
+        size_bytes=firmware.stat().st_size,
+        sha256=sha256_file(firmware),
+    )
+
+    with pytest.raises(WorkflowError, match=r"does not match expected pattern.*ASUS-EAP5000"):
+        workflow.resume("job_wrong_variant", dry_run=True)
+
+
 def _stub_session(config, tmp_path: Path) -> SerialSession:
     """Stub session — only used because the workflow constructs DutWorkflow
     even for paths that abort before any serial I/O. Never actually reads."""

@@ -43,6 +43,20 @@ class ProjectConfig(StrictModel):
     name: str = "owrt-monitor-lab"
     artifact_dir: Path = Path("artifacts")
     state_db: Path | None = None
+    # Optional profile applied when a command does not pass `--profile`.
+    # This lets a lab config keep a normal default board while preserving
+    # explicit overlays for the other boards.
+    default_profile: str | None = None
+
+    @field_validator("default_profile")
+    @classmethod
+    def default_profile_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("project.default_profile must not be blank")
+        return value
 
 
 class BuilderConfig(StrictModel):
@@ -285,17 +299,34 @@ class TransferNetworkRecoveryConfig(StrictModel):
         return value
 
 
+class PostUpgradeNetworkConfig(StrictModel):
+    # Optional post-boot normalization after sysupgrade/bootloader boot. This is
+    # intentionally separate from transfer network recovery, which is runtime-only
+    # and happens before flashing.
+    ensure_dhcp: bool = False
+    interface: str | None = None
+
+    @field_validator("interface")
+    @classmethod
+    def optional_interface_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("upgrade.post_upgrade_network.interface must not be blank")
+        return value
+
+
 class UpgradeConfig(StrictModel):
     transfer: Literal["http", "scp", "tftp", "bootloader_tftp", "custom"] = "http"
     remote_path: str = "/tmp/firmware.bin"
     command: str = "sysupgrade -n /tmp/firmware.bin"
     boot_timeout_sec: int = 240
     transfer_timeout_sec: int = 180
+    host_interface: str | None = None
     http_bind: str = "0.0.0.0"
     http_host: str | None = None
     http_port: int = 0
     tftp_root: str = "/private/tftpboot"
     tftp_host: str | None = None
+    tftp_port: int = 0
     scp_binary: str = "scp"
     scp_user: str = "root"
     scp_host: str | None = None
@@ -308,6 +339,9 @@ class UpgradeConfig(StrictModel):
     bootloader: BootloaderConfig = Field(default_factory=BootloaderConfig)
     network_recovery: TransferNetworkRecoveryConfig = Field(
         default_factory=TransferNetworkRecoveryConfig
+    )
+    post_upgrade_network: PostUpgradeNetworkConfig = Field(
+        default_factory=PostUpgradeNetworkConfig
     )
     # Interactive `[y/N]` prompt right before the destructive command runs.
     # Off by default. When on, reads from stdin via input(); silently skipped
@@ -335,11 +369,11 @@ class UpgradeConfig(StrictModel):
             raise ValueError("upgrade timeouts must be positive")
         return value
 
-    @field_validator("http_port")
+    @field_validator("http_port", "tftp_port")
     @classmethod
-    def http_port_must_be_valid(cls, value: int) -> int:
+    def dynamic_port_must_be_valid(cls, value: int) -> int:
         if value < 0 or value > 65535:
-            raise ValueError("upgrade.http_port must be between 0 and 65535")
+            raise ValueError("upgrade.http_port/upgrade.tftp_port must be between 0 and 65535")
         return value
 
     @field_validator("scp_port")
@@ -389,6 +423,13 @@ class UpgradeConfig(StrictModel):
     def scp_strings_must_not_be_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("upgrade.scp_binary and upgrade.scp_user must not be blank")
+        return value
+
+    @field_validator("host_interface")
+    @classmethod
+    def host_interface_must_not_be_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("upgrade.host_interface must not be blank")
         return value
 
     @field_validator("scp_extra_args")
@@ -642,6 +683,17 @@ class OwrtConfig(StrictModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def default_profile_must_exist(self) -> OwrtConfig:
+        default_profile = self.project.default_profile
+        if default_profile is not None and default_profile not in self.profiles:
+            available = ", ".join(sorted(self.profiles)) or "(no profiles defined)"
+            raise ValueError(
+                f"project.default_profile {default_profile!r} is not defined in profiles; "
+                f"available: {available}"
+            )
+        return self
+
     def artifact_root(self, config_path: Path) -> Path:
         return _resolve_path(self.project.artifact_dir, config_path.parent)
 
@@ -675,6 +727,7 @@ class OwrtConfig(StrictModel):
         overlay = self.profiles[name]
         base = self.model_dump(mode="json")
         base.pop("profiles", None)
+        base["project"]["default_profile"] = None
         merged = _deep_merge(base, overlay)
         try:
             return OwrtConfig.model_validate(merged)
@@ -682,6 +735,10 @@ class OwrtConfig(StrictModel):
             raise ConfigError(
                 f"applying profile {name!r} produced an invalid config: {exc}"
             ) from exc
+
+    def effective_profile(self, requested: str | None) -> str | None:
+        """Return the explicit profile, or the config's default profile."""
+        return requested if requested is not None else self.project.default_profile
 
     def list_profiles(self) -> list[str]:
         return sorted(self.profiles)
