@@ -16,6 +16,8 @@ coverage.out
 # Compiled daemon/CLI binaries built at repo root (go build ./cmd/...)
 /owrtd
 /owrtctl
+/owrt-engine
+*.exe
 
 # Local runtime
 /artifacts/
