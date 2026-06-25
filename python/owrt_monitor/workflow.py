@@ -90,6 +90,108 @@ class BuildWorkflow:
             return self._docker_client_override
         return DockerBuildClient(config.builder)
 
+    def _note_profile_switch(
+        self,
+        switch: dict,
+        logger: EventLogger,
+        report: WorkflowReport,
+        *,
+        dry_run: bool,
+    ) -> None:
+        """Record a detected profile switch on the shared build tree and surface
+        the chosen reaction (`builder.on_profile_switch`) in events + report.
+
+        In `clean` mode the planned cleanup commands are only listed here on a
+        dry run; a real run logs each command as it actually executes instead."""
+        mode = self.config.builder.on_profile_switch
+        cleanup = self.config.builder.profile_switch_cleanup
+        prev_target = " ".join(switch["previous_command"])
+        cur_target = " ".join(switch["current_command"])
+        logger.emit(
+            level="WARN",
+            component="workflow",
+            event="profile_switch_detected",
+            message=(
+                f"shared builder {switch['container']!r} last succeeded building "
+                f"{prev_target!r}; this build targets {cur_target!r}"
+            ),
+            fields={
+                "previous_job": switch["previous_id"],
+                "container": switch["container"],
+                "previous_command": switch["previous_command"],
+                "current_command": switch["current_command"],
+                "mode": mode,
+                "cleanup_commands": [" ".join(c) for c in cleanup],
+            },
+        )
+        report.actions.append(
+            f"Profile switch in shared builder `{switch['container']}`: last success "
+            f"(`{switch['previous_id']}`) built `{prev_target}`, this build targets "
+            f"`{cur_target}`"
+        )
+        if mode == "clean":
+            if cleanup:
+                if dry_run:
+                    for command in cleanup:
+                        report.actions.append(
+                            "Profile-switch cleanup (planned): `" + " ".join(command) + "`"
+                        )
+            else:
+                report.warnings.append(
+                    "builder.on_profile_switch is 'clean' but builder.profile_switch_cleanup "
+                    "is empty — nothing will be cleaned; stale profile-conditional packages "
+                    "may break this build (set the cleanup commands or expect package/install "
+                    "failures)."
+                )
+        elif mode == "warn":
+            report.warnings.append(
+                "profile switch detected on a shared build tree — profile-conditional "
+                "packages may carry stale deps from the previous board; set "
+                "builder.on_profile_switch: clean (with profile_switch_cleanup) to "
+                "auto-clean them."
+            )
+
+    def _run_profile_switch_cleanup(
+        self,
+        docker: DockerBuildClient,
+        switch: dict,
+        logger: EventLogger,
+        report: WorkflowReport,
+        cancel_token: CancelToken,
+    ) -> None:
+        """Execute each configured cleanup command in the builder before building.
+
+        Best-effort per command: a failing clean is logged as a warning and the
+        build proceeds (the build itself will surface any real breakage). This
+        keeps the guard from turning a recoverable stale-state into a hard stop.
+        """
+        cleanup = self.config.builder.profile_switch_cleanup
+        if not cleanup:
+            return
+        for command in cleanup:
+            cancel_token.raise_if_cancelled()
+            rendered = " ".join(command)
+            try:
+                docker.run_cleanup(command)
+            except DockerBuildError as exc:
+                logger.emit(
+                    level="WARN",
+                    component="workflow",
+                    event="profile_switch_cleanup_failed",
+                    message=f"cleanup command failed (continuing): {rendered}",
+                    fields={"command": command, "error": str(exc)},
+                )
+                report.warnings.append(f"profile-switch cleanup failed: {rendered} ({exc})")
+                continue
+            logger.emit(
+                level="INFO",
+                component="workflow",
+                event="profile_switch_cleanup_ran",
+                message=f"cleaned profile-conditional package: {rendered}",
+                fields={"command": command, "previous_job": switch["previous_id"]},
+            )
+            report.actions.append("Profile-switch cleanup (ran): `" + rendered + "`")
+
     def run(self, *, dry_run: bool = False, allow_flash: bool = False) -> WorkflowReport:
         job_id = _new_job_id()
         run_dir = self.artifact_root / job_id
@@ -119,6 +221,9 @@ class BuildWorkflow:
         _emit_config_diff_from_last_success(
             self.store, job_id, config_snapshot, logger, report
         )
+        profile_switch = _detect_profile_switch(self.store, job_id, config_snapshot)
+        if profile_switch is not None:
+            self._note_profile_switch(profile_switch, logger, report, dry_run=dry_run)
 
         builder_lock_acquired = False
         try:
@@ -181,6 +286,11 @@ class BuildWorkflow:
                 dut_workflow.preflight_serial_interactive()
                 cancel_token.raise_if_cancelled()
             docker.preflight()
+            cancel_token.raise_if_cancelled()
+            if profile_switch is not None and self.config.builder.on_profile_switch == "clean":
+                self._run_profile_switch_cleanup(
+                    docker, profile_switch, logger, report, cancel_token
+                )
             cancel_token.raise_if_cancelled()
             self._transition(logger, job_id, JobState.BUILD_RUNNING, "OpenWrt build started")
             try:
@@ -767,6 +877,50 @@ def _emit_config_diff_from_last_success(
             ],
         },
     )
+
+
+def _detect_profile_switch(
+    store: JobStore,
+    job_id: str,
+    current_snapshot: dict,
+) -> dict | None:
+    """Detect whether the last successful build in this *same* build tree targeted
+    a different board than the one we're about to build.
+
+    AP/controller/gateway share one OpenWrt build tree, and OpenWrt won't rebuild
+    a package just because the target profile changed. A package with profile-
+    conditional DEPENDS therefore keeps the previous profile's deps and breaks
+    `package/install`. We flag this so the workflow can clean (or warn).
+
+    Returns a dict describing the switch, or None when there's nothing to flag.
+    Best-effort: never raises. Keyed off `builder.command` (the make target,
+    which encodes the board) and gated on a matching `builder.container` so two
+    builds on different hosts/trees are never confused for a switch. A *failed*
+    build never becomes the "last successful job", so the switch keeps being
+    detected on retries until the new board builds cleanly.
+    """
+    try:
+        last = store.last_successful_job(exclude_id=job_id)
+    except Exception:
+        return None
+    if last is None or not last.get("config_snapshot"):
+        return None
+    prev_builder = (last["config_snapshot"] or {}).get("builder") or {}
+    cur_builder = (current_snapshot or {}).get("builder") or {}
+    if not prev_builder.get("container") or not cur_builder.get("container"):
+        return None
+    if prev_builder["container"] != cur_builder["container"]:
+        return None
+    prev_command = prev_builder.get("command")
+    cur_command = cur_builder.get("command")
+    if not prev_command or not cur_command or prev_command == cur_command:
+        return None
+    return {
+        "previous_id": last["id"],
+        "container": cur_builder["container"],
+        "previous_command": prev_command,
+        "current_command": cur_command,
+    }
 
 
 def _assert_artifact_matches_dut(

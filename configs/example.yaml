@@ -18,6 +18,16 @@ builder:
     BUILD_CCACHE: "1"
     FORCE_UNSAFE_CONFIGURE: "1"
   timeout_sec: 0
+  # AP/controller/gateway profiles share this one build tree (build/owrt2102),
+  # and OpenWrt won't rebuild a package just because the target profile changed.
+  # asus-base-files has profile-conditional DEPENDS (+pgsql-server only on the
+  # Controller profile), so building controller and then switching back to an AP
+  # profile leaves a stale asus-base-files.ipk that still wants pgsql-server and
+  # breaks package/install. When the last successful build here targeted a
+  # different board, clean the affected package(s) first.
+  on_profile_switch: clean
+  profile_switch_cleanup:
+    - [make, "-C", "build/owrt2102", "package/asus-base-files/clean"]
 
 artifact:
   # enw-device-firmware writes per-profile output to build/<framework>/bin/target/

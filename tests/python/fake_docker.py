@@ -38,6 +38,7 @@ class FakeDockerBuildClient:
     preflight_should_fail: bool = False
     preflight_failure_message: str = "simulated preflight failure"
     on_run_build: Callable[[Path], None] | None = None
+    cleanup_should_fail: bool = False
 
     git_metadata: dict[str, object] = field(
         default_factory=lambda: {
@@ -53,6 +54,7 @@ class FakeDockerBuildClient:
     list_artifacts_calls: list[list[str]] = field(default_factory=list)
     copy_artifact_calls: list[ArtifactCandidate] = field(default_factory=list)
     gather_build_metadata_calls: int = field(default=0)
+    run_cleanup_calls: list[list[str]] = field(default_factory=list)
 
     def build_command(self, *, redact_env: bool = False) -> list[str]:
         cmd = ["docker", "exec", "--workdir", self.builder.workdir]
@@ -87,6 +89,12 @@ class FakeDockerBuildClient:
     def gather_build_metadata(self) -> dict[str, object]:
         self.gather_build_metadata_calls += 1
         return dict(self.git_metadata)
+
+    def run_cleanup(self, command: list[str]) -> str:
+        self.run_cleanup_calls.append(list(command))
+        if self.cleanup_should_fail:
+            raise DockerBuildError(f"simulated cleanup failure: {' '.join(command)}")
+        return f"cleaned: {' '.join(command)}\n"
 
     def list_artifacts(self, patterns: list[str]) -> list[ArtifactCandidate]:
         self.list_artifacts_calls.append(list(patterns))

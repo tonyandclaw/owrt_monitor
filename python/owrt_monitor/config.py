@@ -72,6 +72,23 @@ class BuilderConfig(StrictModel):
     # confirm the lab's customised feeds are checked out). Each is verified
     # with `docker exec test -e`. Empty list disables the check.
     required_paths: list[str] = Field(default_factory=list)
+    # Cross-profile contamination guard. AP/controller/gateway share one build
+    # tree (e.g. build/owrt2102), and OpenWrt does not rebuild a package just
+    # because the target profile changed — so a package with profile-conditional
+    # DEPENDS (e.g. asus-base-files gaining +pgsql-server only on the Controller
+    # profile) keeps the *previous* profile's deps and breaks `package/install`.
+    # When the last successful build in this same builder targeted a different
+    # `command` (board), the workflow reacts per `on_profile_switch`:
+    #   "off"   -> do nothing
+    #   "warn"  -> log a warning + note it in the report (default)
+    #   "clean" -> run each `profile_switch_cleanup` command in the container
+    #              (workdir) before building, then build normally
+    on_profile_switch: str = "warn"
+    # Commands run (as argument arrays, no shell) inside the builder workdir when
+    # a profile switch is detected and `on_profile_switch` is "clean". Typically
+    # one `make package/<name>/clean` per profile-conditional package, e.g.
+    # `[[make, "-C", "build/owrt2102", "package/asus-base-files/clean"]]`.
+    profile_switch_cleanup: list[list[str]] = Field(default_factory=list)
 
     @field_validator("command")
     @classmethod
@@ -101,6 +118,26 @@ class BuilderConfig(StrictModel):
     def builder_lock_timeout_must_be_positive(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("builder.lock_timeout_sec must be positive")
+        return value
+
+    @field_validator("on_profile_switch")
+    @classmethod
+    def on_profile_switch_must_be_known(cls, value: str) -> str:
+        allowed = {"off", "warn", "clean"}
+        if value not in allowed:
+            raise ValueError(
+                f"builder.on_profile_switch must be one of {sorted(allowed)}, got {value!r}"
+            )
+        return value
+
+    @field_validator("profile_switch_cleanup")
+    @classmethod
+    def cleanup_commands_must_not_be_empty(cls, value: list[list[str]]) -> list[list[str]]:
+        for command in value:
+            if not command:
+                raise ValueError(
+                    "each builder.profile_switch_cleanup entry must contain at least one argument"
+                )
         return value
 
 

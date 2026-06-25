@@ -29,6 +29,11 @@ type BuilderConfig struct {
 	MinFreeDiskMB  int               `yaml:"min_free_disk_mb" json:"min_free_disk_mb"`
 	LockTimeoutSec int               `yaml:"lock_timeout_sec" json:"lock_timeout_sec"`
 	RequiredPaths  []string          `yaml:"required_paths" json:"required_paths"`
+	// Cross-profile contamination guard (see config.py BuilderConfig). The Go
+	// engine accepts and round-trips these for config parity; the build-time
+	// reaction lives in the Python workflow.
+	OnProfileSwitch      string     `yaml:"on_profile_switch" json:"on_profile_switch"`
+	ProfileSwitchCleanup [][]string `yaml:"profile_switch_cleanup" json:"profile_switch_cleanup"`
 }
 
 // ArtifactConfig mirrors config.py ArtifactConfig.
@@ -222,7 +227,8 @@ func Defaults() OwrtConfig {
 		Project: ProjectConfig{Name: "owrt-monitor-lab", ArtifactDir: "artifacts"},
 		Builder: BuilderConfig{
 			Env: map[string]string{}, MinFreeDiskMB: 5000, LockTimeoutSec: 3600,
-			RequiredPaths: []string{},
+			RequiredPaths: []string{}, OnProfileSwitch: "warn",
+			ProfileSwitchCleanup: [][]string{},
 		},
 		Artifact: ArtifactConfig{
 			RegexPatterns: []string{}, Selection: "newest", MinSizeMB: 0, RequireSHA256: true,

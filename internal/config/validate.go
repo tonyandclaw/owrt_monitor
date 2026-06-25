@@ -65,6 +65,16 @@ func (b *BuilderConfig) validate() error {
 	if b.LockTimeoutSec <= 0 {
 		return fmt.Errorf("builder.lock_timeout_sec must be positive")
 	}
+	switch b.OnProfileSwitch {
+	case "", "off", "warn", "clean":
+	default:
+		return fmt.Errorf("builder.on_profile_switch must be one of [clean off warn], got %q", b.OnProfileSwitch)
+	}
+	for _, cmd := range b.ProfileSwitchCleanup {
+		if len(cmd) == 0 {
+			return fmt.Errorf("each builder.profile_switch_cleanup entry must contain at least one argument")
+		}
+	}
 	return nil
 }
 

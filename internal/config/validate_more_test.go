@@ -30,6 +30,8 @@ func TestValidatorBranches(t *testing.T) {
 		"retry attempts":        base + "retry: {smoke_tests: {attempts: 0}}\n",
 		"retry backoff":         base + "retry: {smoke_tests: {backoff_sec: -1}}\n",
 		"default profile blank": base + "project: {default_profile: '  '}\n",
+		"on_profile_switch bad": "builder: {container: c, workdir: /w, command: [make], on_profile_switch: nuke}\nartifact: {patterns: [x]}\n",
+		"empty cleanup command": "builder: {container: c, workdir: /w, command: [make], profile_switch_cleanup: [[]]}\nartifact: {patterns: [x]}\n",
 	}
 	for name, body := range cases {
 		path := writeTemp(t, body)

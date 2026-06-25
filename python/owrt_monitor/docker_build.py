@@ -171,6 +171,32 @@ class DockerBuildClient:
         if return_code != 0:
             raise DockerBuildError(f"build command failed with exit code {return_code}")
 
+    def run_cleanup(self, command: list[str]) -> str:
+        """Run a maintenance command (argument array, no shell) in the builder
+        workdir — e.g. `["make", "-C", "build/owrt2102", "package/x/clean"]`.
+
+        Used by the profile-switch guard to clean profile-conditional packages
+        before a build. Carries the same `builder.env` as the build so commands
+        that need it (e.g. FORCE_UNSAFE_CONFIGURE) behave identically. Returns
+        captured stdout/stderr; raises DockerBuildError on a non-zero exit.
+        """
+        if not command:
+            raise DockerBuildError("cleanup command must contain at least one argument")
+        full_command = ["docker", "exec", "--workdir", self.builder.workdir]
+        for key, value in sorted(self.builder.env.items()):
+            full_command.extend(["-e", f"{key}={value}"])
+        full_command.append(self.builder.container)
+        full_command.extend(command)
+        result = subprocess.run(full_command, check=False, capture_output=True, text=True)
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip() or "no output")
+            raise DockerBuildError(
+                f"cleanup command {' '.join(command)!r} failed with exit "
+                f"code {result.returncode}: {detail}"
+            )
+        return output
+
     def list_artifacts(self, patterns: list[str]) -> list[ArtifactCandidate]:
         # Bash-only detector: uses `shopt -s globstar nullglob` for `**` support and
         # GNU `stat -c` for size + mtime. Avoids depending on python3 inside the

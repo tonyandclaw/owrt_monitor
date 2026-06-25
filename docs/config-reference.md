@@ -23,6 +23,23 @@ fail loudly at load time.
 - `min_free_disk_mb`: Minimum free MB on `workdir`'s filesystem before preflight passes.
   Default `5000`. Set to `0` to disable. Uses `df -B1 --output=avail` (GNU coreutils);
   silently skipped if `df` introspection fails inside the container.
+- `required_paths`: Optional absolute paths inside `workdir` that must exist before the
+  build runs (verified with `docker exec test -e`). Empty list disables the check.
+- `on_profile_switch`: Cross-profile contamination guard for shared build trees. When the
+  last **successful** build in this same `container` targeted a different `command` (board),
+  one of: `off` (do nothing), `warn` (log + note in report; default), `clean` (run
+  `profile_switch_cleanup` before building). Why: AP/controller/gateway share one OpenWrt
+  build tree, and OpenWrt does not rebuild a package just because the target profile changed
+  — so a package with profile-conditional `DEPENDS` (e.g. `asus-base-files` gaining
+  `+pgsql-server` only on the Controller profile) keeps the previous profile's deps and
+  breaks `package/install`. A failed build never becomes the "last successful" job, so the
+  switch keeps being detected on retries until the new board builds cleanly.
+- `profile_switch_cleanup`: Commands (argument arrays, no shell) run in `workdir` when a
+  switch is detected and `on_profile_switch: clean` — typically one
+  `make package/<name>/clean` per profile-conditional package, e.g.
+  `[[make, "-C", "build/owrt2102", "package/asus-base-files/clean"]]`. A failing cleanup is
+  logged as a warning and the build proceeds (the build surfaces any real breakage). In
+  `dry-run` the commands are listed in the report but not executed.
 
 ## artifact
 
